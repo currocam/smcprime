@@ -1,6 +1,7 @@
+use ordered_float::NotNan;
 use rand::prelude::*;
 use rand_distr::{Exp, Uniform};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 use tskit::{TableCollection, TableSortOptions, TskitError};
 
@@ -98,6 +99,13 @@ struct CoalTree {
     time: Vec<Time>,
     parent: Vec<Option<NodeID>>,
     children: Vec<Vec<NodeID>>,
+    scratch_times: Vec<f64>,
+    /// BTreeMap keyed by parent time (NotNan::new(f64::INFINITY) for the root).
+    /// Value: child node IDs whose branch ends at that parent time.
+    /// Enables O(k) stabbing queries: range keys > t, filter birth_time < t.
+    branch_map: BTreeMap<NotNan<f64>, Vec<NodeID>>,
+    /// Maintained incrementally; updated in spr() via removed/added edge lists.
+    total_branch_length: f64,
 }
 
 /// Simulate independent coalescent tree
@@ -154,33 +162,58 @@ impl CoalTree {
             t = coal_time;
         }
 
+        // Build branch_map and compute total_branch_length in one pass
+        let mut branch_map: BTreeMap<NotNan<f64>, Vec<NodeID>> = BTreeMap::new();
+        let mut total_branch_length = 0.0;
+        for i in 0..time.len() {
+            match parent[i] {
+                Some(p_id) => {
+                    branch_map
+                        .entry(NotNan::new(time[p_id]).unwrap())
+                        .or_default()
+                        .push(i);
+                    total_branch_length += time[p_id] - time[i];
+                }
+                None => {
+                    if !children[i].is_empty() {
+                        branch_map
+                            .entry(NotNan::new(f64::INFINITY).unwrap())
+                            .or_default()
+                            .push(i);
+                    }
+                }
+            }
+        }
+
         CoalTree {
             num_samples,
             time,
             parent,
             children,
+            scratch_times: Vec::new(),
+            branch_map,
+            total_branch_length,
         }
     }
     fn total_branch_length(&self) -> f64 {
-        let mut total = 0.0;
-        for i in 0..self.time.len() {
-            if let Some(p) = self.parent[i] {
-                total += self.time[p] - self.time[i];
-            }
-        }
-        total
+        self.total_branch_length
     }
     /// Pick a point uniformly on the tree. Returns (node, t_recomb) where the
     /// recombination falls on the branch from `node` to its parent.
     fn uniform_point(&self, rng: &mut impl Rng) -> (NodeID, Time) {
-        let total = self.total_branch_length();
-        let mut remaining: f64 = Uniform::new(0.0, total).expect("valid").sample(rng);
+        let mut remaining: f64 = Uniform::new(0.0, self.total_branch_length)
+            .expect("valid")
+            .sample(rng);
 
-        for i in 0..self.time.len() {
-            if let Some(p) = self.parent[i] {
-                let branch_len = self.time[p] - self.time[i];
+        // Iterate only live edges (2n-2 entries) via branch_map, skipping the
+        // INFINITY key which holds root nodes that have no parent edge.
+        let inf_key = Self::nn(f64::INFINITY);
+        for (&death_key, children) in self.branch_map.range(..inf_key) {
+            let death_time = *death_key;
+            for &child in children {
+                let branch_len = death_time - self.time[child];
                 if remaining < branch_len {
-                    return (i, self.time[i] + remaining);
+                    return (child, self.time[child] + remaining);
                 }
                 remaining -= branch_len;
             }
@@ -188,19 +221,65 @@ impl CoalTree {
         unreachable!()
     }
 
-    /// Intervals above `t_recomb` where lineages are constant
-    /// Returns `(t_start, t_end, num_lineages)` triples; the last has `t_end = INF`.
-    fn lineage_count_intervals_above(&self, t_recomb: f64) -> Vec<(Time, Time, usize)> {
-        // Collect coalescence times of live internal nodes above t_recomb
-        let mut event_times: Vec<f64> = Vec::new();
-        for i in self.num_samples..self.time.len() {
-            if !self.children[i].is_empty() && self.time[i] > t_recomb {
-                event_times.push(self.time[i]);
+    fn nn(t: f64) -> NotNan<f64> {
+        NotNan::new(t).unwrap()
+    }
+
+    fn bmap_remove(map: &mut BTreeMap<NotNan<f64>, Vec<NodeID>>, key: NotNan<f64>, node: NodeID) {
+        if let Some(v) = map.get_mut(&key) {
+            if let Some(pos) = v.iter().position(|&x| x == node) {
+                v.swap_remove(pos);
+            }
+            if v.is_empty() {
+                map.remove(&key);
             }
         }
-        event_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    }
 
-        // Count lineages at t_recomb = num_samples - (live coal events at or below t_recomb)
+    fn bmap_add(map: &mut BTreeMap<NotNan<f64>, Vec<NodeID>>, key: NotNan<f64>, node: NodeID) {
+        map.entry(key).or_default().push(node);
+    }
+
+    fn nth_branch_at_time(&self, t: f64, idx: usize) -> usize {
+        use std::ops::Bound::Excluded;
+        let t_key = Self::nn(t);
+        let mut count = 0;
+        for (_, children) in self
+            .branch_map
+            .range((Excluded(t_key), std::ops::Bound::Unbounded))
+        {
+            for &child in children {
+                if self.time[child] < t {
+                    if count == idx {
+                        return child;
+                    }
+                    count += 1;
+                }
+            }
+        }
+        unreachable!("idx out of range in nth_branch_at_time")
+    }
+
+    /// Draw re-coalescence time and target branch on the (original) tree.
+    /// The floating lineage starts at `t_recomb` and coalesces at rate
+    /// `n_lineages(t) * lambda(t)`.
+    fn draw_recoalescence(
+        &mut self,
+        rng: &mut impl Rng,
+        demography: &Demography,
+        t_recomb: f64,
+    ) -> (Time, usize) {
+        // Collect and sort coalescence times of live internal nodes above t_recomb
+        self.scratch_times.clear();
+        for i in self.num_samples..self.time.len() {
+            if !self.children[i].is_empty() && self.time[i] > t_recomb {
+                self.scratch_times.push(self.time[i]);
+            }
+        }
+        self.scratch_times
+            .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+        // Count lineages at t_recomb
         let mut n_lineages = self.num_samples;
         for i in self.num_samples..self.time.len() {
             if !self.children[i].is_empty() && self.time[i] <= t_recomb {
@@ -208,56 +287,18 @@ impl CoalTree {
             }
         }
 
-        let mut intervals = Vec::new();
+        let mut e: f64 = Exp::new(1.0).expect("1.0 is valid").sample(rng);
         let mut t_start = t_recomb;
         let mut k = n_lineages;
-        for &t in &event_times {
-            intervals.push((t_start, t, k));
-            k -= 1;
-            t_start = t;
-        }
-        // After the MRCA there is 1 lineage extending to infinity
-        intervals.push((t_start, Time::INFINITY, k));
-        intervals
-    }
 
-    fn branches_at_time(&self, t: f64) -> Vec<usize> {
-        let mut branches = Vec::new();
-        for i in 0..self.time.len() {
-            if self.time[i] >= t {
-                continue;
-            }
-            match self.parent[i] {
-                Some(p) => {
-                    if self.time[p] > t {
-                        branches.push(i);
-                    }
-                }
-                None => {
-                    // Root of current tree: its branch extends to infinity
-                    if !self.children[i].is_empty() {
-                        branches.push(i);
-                    }
-                }
-            }
-        }
-        branches
-    }
-
-    /// Draw re-coalescence time and target branch on the (original) tree.
-    /// The floating lineage starts at `t_recomb` and coalesces at rate
-    /// `n_lineages(t) * lambda(t)`.
-    fn draw_recoalescence(
-        &self,
-        rng: &mut impl Rng,
-        demography: &Demography,
-        t_recomb: f64,
-    ) -> (Time, usize) {
-        let intervals = self.lineage_count_intervals_above(t_recomb);
-        let mut e: f64 = Exp::new(1.0).expect("1.0 is valid").sample(rng);
-
-        for &(t_start, t_end, n_lineages) in &intervals {
-            let rate_mult = n_lineages as f64;
+        // Walk intervals on the fly; the last has t_end = INF (one lineage to MRCA)
+        for interval_idx in 0..=self.scratch_times.len() {
+            let t_end = if interval_idx < self.scratch_times.len() {
+                self.scratch_times[interval_idx]
+            } else {
+                Time::INFINITY
+            };
+            let rate_mult = k as f64;
             let mut current_t = t_start;
             while current_t < t_end {
                 let ei = demography.epoch_index_at(current_t);
@@ -272,14 +313,15 @@ impl CoalTree {
                 let budget = rate * (sub_end - current_t);
                 if e <= budget {
                     let t_coal = current_t + e / rate;
-                    let branches = self.branches_at_time(t_coal);
-                    let target =
-                        branches[Uniform::new(0, branches.len()).expect("valid").sample(rng)];
+                    let target_idx = Uniform::new(0, k).expect("valid").sample(rng);
+                    let target = self.nth_branch_at_time(t_coal, target_idx);
                     return (t_coal, target);
                 }
                 e -= budget;
                 current_t = sub_end;
             }
+            k -= 1;
+            t_start = t_end;
         }
         unreachable!("last interval is infinite")
     }
@@ -311,6 +353,13 @@ impl CoalTree {
 
         let mut added;
 
+        let g_key = match g {
+            Some(g_id) => Self::nn(self.time[g_id]),
+            None => Self::nn(f64::INFINITY),
+        };
+        let p_key = Self::nn(self.time[p]);
+        let n_key = Self::nn(t_coal);
+
         if t == s {
             // Regraft lands on sibling's branch (which now spans up to g after prune)
             // New node n replaces p structurally
@@ -331,9 +380,21 @@ impl CoalTree {
                 let pos = self.children[g_id].iter().position(|&x| x == p).unwrap();
                 self.children[g_id][pos] = n;
             }
+
+            // Update branch_map: p loses c and s; p removed from g; n gains c and s; n added to g
+            Self::bmap_remove(&mut self.branch_map, p_key, c);
+            Self::bmap_remove(&mut self.branch_map, p_key, s);
+            Self::bmap_remove(&mut self.branch_map, g_key, p);
+            Self::bmap_add(&mut self.branch_map, n_key, c);
+            Self::bmap_add(&mut self.branch_map, n_key, s);
+            Self::bmap_add(&mut self.branch_map, g_key, n);
         } else {
             // General case: prune p, reconnect s to g, then insert n on t's branch
             let q = self.parent[t]; // t's original parent (unaffected by prune since t != s)
+            let q_key = match q {
+                Some(q_id) => Self::nn(self.time[q_id]),
+                None => Self::nn(f64::INFINITY),
+            };
 
             if let Some(q_id) = q {
                 removed.push((q_id, t));
@@ -368,6 +429,24 @@ impl CoalTree {
                 let pos = self.children[q_id].iter().position(|&x| x == t).unwrap();
                 self.children[q_id][pos] = n;
             }
+
+            // Update branch_map: p loses c and s; p removed from g; t removed from q;
+            // s added to g; t and c added to n; n added to q
+            Self::bmap_remove(&mut self.branch_map, p_key, c);
+            Self::bmap_remove(&mut self.branch_map, p_key, s);
+            Self::bmap_remove(&mut self.branch_map, g_key, p);
+            Self::bmap_remove(&mut self.branch_map, q_key, t);
+            Self::bmap_add(&mut self.branch_map, g_key, s);
+            Self::bmap_add(&mut self.branch_map, n_key, t);
+            Self::bmap_add(&mut self.branch_map, n_key, c);
+            Self::bmap_add(&mut self.branch_map, q_key, n);
+        }
+
+        for &(par, chi) in &removed {
+            self.total_branch_length -= self.time[par] - self.time[chi];
+        }
+        for &(par, chi) in &added {
+            self.total_branch_length += self.time[par] - self.time[chi];
         }
 
         (removed, added)
