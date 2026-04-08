@@ -60,6 +60,50 @@ impl Demography {
             }],
         })
     }
+
+    pub fn from_tuples(epochs: &[(f64, f64)]) -> Result<Self, SMCPrimeError> {
+        if epochs.is_empty() {
+            return Err(SMCPrimeError::InvalidDemography(
+                "Demography must include at least one epoch".into(),
+            ));
+        }
+
+        let (first_time, _) = epochs[0];
+        if !first_time.is_finite() || first_time != 0.0 {
+            return Err(SMCPrimeError::InvalidDemography(
+                "First epoch must start at time 0".into(),
+            ));
+        }
+
+        let mut parsed_epochs = Vec::with_capacity(epochs.len());
+        let mut prev_time = f64::NEG_INFINITY;
+        for (i, &(start_time, ne)) in epochs.iter().enumerate() {
+            if !start_time.is_finite() {
+                return Err(SMCPrimeError::InvalidDemography(format!(
+                    "Epoch start time at index {i} must be finite"
+                )));
+            }
+            if i > 0 && start_time <= prev_time {
+                return Err(SMCPrimeError::InvalidDemography(
+                    "Epoch start times must be strictly increasing".into(),
+                ));
+            }
+            if !ne.is_finite() || ne <= 0.0 {
+                return Err(SMCPrimeError::InvalidDemography(format!(
+                    "Epoch size at index {i} must be a positive finite number"
+                )));
+            }
+            parsed_epochs.push(Epoch {
+                start_time,
+                lambda: 1.0 / ne,
+            });
+            prev_time = start_time;
+        }
+
+        Ok(Self {
+            epochs: parsed_epochs,
+        })
+    }
 }
 
 // If we have k free lineages, we can draw waiting time
@@ -124,7 +168,7 @@ impl CoalTree {
         while lineages.len() > 1 {
             let k = lineages.len();
             let rate_mult = (k * (k - 1) / 2) as f64; // C(k, 2)
-            let coal_time = draw_coalescence_time(rng, &demography, t, rate_mult);
+            let coal_time = draw_coalescence_time(rng, demography, t, rate_mult);
 
             // Pick 2 distinct lineages with equal probability for every unordered pair.
             // Sampling idx2 from [0, k-1) and then shifting it up when idx2 >= idx1
@@ -507,10 +551,10 @@ pub fn sim_ancestry(
         let (removed, added) = tree.spr(cut_node, effective_target, t_coal);
         // Close removed edges
         for &(par, chi) in &removed {
-            if let Some(left) = open_edges.remove(&(par, chi)) {
-                if x > left {
-                    edge_records.push((left, x, par, chi));
-                }
+            if let Some(left) = open_edges.remove(&(par, chi))
+                && x > left
+            {
+                edge_records.push((left, x, par, chi));
             }
         }
         // Open added edges
@@ -627,8 +671,7 @@ mod tests {
             num_samples in 2usize..=50,
             demography in arb_demography(),
         ) {
-            let mut rng = rand::rngs::Xoshiro256PlusPlus::seed_from_u64(seed);
-            let arg = sim_ancestry(
+            let _arg = sim_ancestry(
                 &demography, num_samples, 1.0, 1.0, seed
             ).unwrap();
         }

@@ -3,29 +3,6 @@ use pyo3::prelude::*;
 mod ffi;
 /// Implements SMC++ simulations
 mod simulations;
-/// Export tskit errors
-#[derive(Debug)]
-enum Error {
-    Tskit(tskit::TskitError),
-    Message(String),
-}
-
-impl From<tskit::TskitError> for Error {
-    fn from(value: tskit::TskitError) -> Self {
-        Self::Tskit(value)
-    }
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Tskit(e) => write!(f, "{e}"),
-            Self::Message(m) => write!(f, "{m}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 /// A Python module implemented in Rust.
 #[pymodule]
@@ -47,7 +24,7 @@ mod smc_prime {
         recombination_rate: Option<f64>,
         random_seed: Option<u64>,
     ) -> PyResult<Py<PyAny>> {
-        let random_seed = random_seed.unwrap_or_else(|| rand::random());
+        let random_seed = random_seed.unwrap_or_else(rand::random);
         if num_samples < 2 {
             return Err(PyRuntimeError::new_err("num_samples must be at least 2"));
         }
@@ -55,9 +32,8 @@ mod smc_prime {
             simulations::Demography::constant(ne)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         } else if let Ok(pairs) = population_size.extract::<Vec<(f64, f64)>>() {
-            todo!()
-            //simulations::Demography::from_tuples(&pairs)
-            //.map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            simulations::Demography::from_tuples(&pairs)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         } else {
             return Err(PyRuntimeError::new_err(
                 "population_size must be a number or a list of (time, size) tuples",
