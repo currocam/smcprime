@@ -145,3 +145,14 @@ def test_sim_ancestry_rejects_invalid_piecewise_haploid_ne():
         smc_prime.sim_ancestry(
             population_size=[(1.0, 100.0)], num_samples=2, random_seed=1
         )
+
+
+def test_sim_ancestry_variable_returns_tree_sequence_with_constant_callable():
+    ts = smc_prime.sim_ancestry_variable(
+        population_size_fn=lambda x: 1000,
+        num_samples=10,
+        recombination_rate=1.0,
+        sequence_length=10.0,
+    )
+    assert isinstance(ts, tskit.TreeSequence)
+    assert ts.num_samples == 10

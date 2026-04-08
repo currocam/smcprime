@@ -1,3 +1,4 @@
+use enterpolation::Curve;
 use ordered_float::NotNan;
 use rand::prelude::*;
 use rand_distr::{Exp, Uniform};
@@ -600,9 +601,120 @@ pub fn sim_ancestry(
     Ok(table)
 }
 
+pub fn sim_ancestry_variable<C>(
+    interpolator: C,
+    num_samples: usize,
+    sequence_length: f64,
+    recombination_rate: f64,
+    seed: u64,
+) -> Result<TableCollection, TskitError>
+where
+    C: Curve<f64, Output = f64>,
+{
+    // I think this is an adequate random seed generator for this purpose.
+    let mut rng = rand::rngs::Xoshiro256PlusPlus::seed_from_u64(seed);
+    // We initialize the ARG at x=0
+    let mut x = 0.0;
+    // Evaluate demography at genomic position x
+    let demography = |x: f64| -> Demography {
+        Demography::constant(interpolator.eval(x)).expect("interpolated Ne must be positive")
+    };
+    let mut tree = CoalTree::draw(&mut rng, num_samples, &demography(x));
+
+    // We have to keep track of "active" edges (i.e. those that go up to sequence_length)
+    // Open edges: (parent_node, child_node) -> left genomic position
+    let mut open_edges: HashMap<(usize, usize), f64> = HashMap::new();
+    // Recorded edges: (left, right, parent_node, child_node)
+    let mut edge_records: Vec<(f64, f64, usize, usize)> = Vec::new();
+
+    // Open all initial tree edges at position 0
+    for i in 0..tree.time.len() {
+        if let Some(p) = tree.parent[i] {
+            open_edges.insert((p, i), 0.0);
+        }
+    }
+    while x < sequence_length {
+        // This could be change to update iteratively for better performance.
+        let total_bl = tree.total_branch_length();
+        let rate = recombination_rate * total_bl;
+        x += Exp::new(rate)
+            .expect("Invalid coalescence rate")
+            .sample(&mut rng);
+        if x >= sequence_length {
+            break;
+        }
+        // We pick a point in the tree uniformly
+        let (cut_node, t_recomb) = tree.uniform_point(&mut rng);
+        let (t_coal, target_node) = tree.draw_recoalescence(&mut rng, &demography(x), t_recomb);
+        // Healing: re-coalescence lands on the same branch that was cut
+        if target_node == cut_node {
+            continue;
+        }
+        // If target is the parent being pruned, remap to sibling (whose branch
+        // absorbs p's range after the prune)
+        let p = tree.parent[cut_node].unwrap();
+        let effective_target = if target_node == p {
+            *tree.children[p].iter().find(|&&c| c != cut_node).unwrap()
+        } else {
+            target_node
+        };
+
+        let (removed, added) = tree.spr(cut_node, effective_target, t_coal);
+        // Close removed edges
+        for &(par, chi) in &removed {
+            if let Some(left) = open_edges.remove(&(par, chi))
+                && x > left
+            {
+                edge_records.push((left, x, par, chi));
+            }
+        }
+        // Open added edges
+        for &(par, chi) in &added {
+            open_edges.insert((par, chi), x);
+        }
+    }
+    // We're done!
+    // Close all remaining open edges at sequence_length
+    for ((par, chi), left) in open_edges.drain() {
+        if sequence_length > left {
+            edge_records.push((left, sequence_length, par, chi));
+        }
+    }
+    let mut table = TableCollection::new(sequence_length)?;
+    let population = table.add_population()?;
+    let defaults = tskit::NodeDefaults {
+        population,
+        ..Default::default()
+    };
+    let sample_defaults = tskit::NodeDefaults {
+        flags: tskit::NodeFlags::new_sample(),
+        population,
+        ..Default::default()
+    };
+
+    let mut node_ids = Vec::new();
+    for i in 0..tree.time.len() {
+        let nid = if i < num_samples {
+            table.add_node_with_defaults(0.0, &sample_defaults)?
+        } else {
+            table.add_node_with_defaults(tree.time[i], &defaults)?
+        };
+        node_ids.push(nid);
+    }
+
+    for &(left, right, par, chi) in &edge_records {
+        table.add_edge(left, right, node_ids[par], node_ids[chi])?;
+    }
+
+    table.full_sort(TableSortOptions::default())?;
+    table.build_index()?;
+    Ok(table)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enterpolation::linear::Linear;
     use proptest::prelude::*;
 
     /// Generate a valid piecewise-constant demography. Epoch boundaries are
@@ -675,5 +787,15 @@ mod tests {
                 &demography, num_samples, 1.0, 1.0, seed
             ).unwrap();
         }
+    }
+
+    #[test]
+    fn sim_ancestry_variable_accepts_constant_linear_interpolator() {
+        let interpolator = Linear::builder()
+            .elements([1.0, 1.0])
+            .knots([0.0, 1.0])
+            .build()
+            .unwrap();
+        assert!(sim_ancestry_variable(interpolator, 2, 1.0, 1.0, 1234).is_ok());
     }
 }
