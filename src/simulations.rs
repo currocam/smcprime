@@ -1,8 +1,9 @@
-use enterpolation::Curve;
+use arrayvec::ArrayVec;
 use ordered_float::NotNan;
 use rand::prelude::*;
 use rand_distr::{Exp, Uniform};
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound::Excluded;
 use thiserror::Error;
 use tskit::{TableCollection, TableSortOptions, TskitError};
 
@@ -12,19 +13,53 @@ type Edge = (NodeID, NodeID);
 
 #[derive(Debug, Error)]
 pub enum SMCPrimeError {
-    //#[error("Tskit error: {0}")]
-    //TskitError(#[from] TskitError),
     #[error("Invalid demography: {0}")]
     InvalidDemography(String),
 }
 
-// Demographic history can be approximated with a piecewise-function,
-// assuming $\lambda\ is constant within the epoch.
 #[derive(Debug, Clone)]
 struct Epoch {
     start_time: Time,
-    lambda: f64,
+    // TODO: rename into lambda_start
+    lambda_0: f64, // 1/N0 at epoch start
+    alpha: f64,    // growth rate (0.0 = constant)
 }
+
+impl Epoch {
+    /// Cumulative hazard integral from t1 to t2 (unit rate multiplier).
+    fn cumulative_hazard(&self, t1: Time, t2: Time) -> f64 {
+        if self.alpha == 0.0 {
+            self.lambda_0 * (t2 - t1)
+        } else {
+            let a = self.alpha;
+            let s = self.start_time;
+            // TODO: can we do this numerically more robust?
+            (self.lambda_0 / a) * ((a * (t2 - s)).exp() - (a * (t1 - s)).exp())
+        }
+    }
+
+    /// Invert the cumulative hazard: find t_coal > t1 such that k * H(t1, t_coal) = e.
+    /// Returns None if coalescence cannot happen in this epoch (alpha < 0, integral converges).
+    // FIXME: previous line is incorrect. We cannot ignore when alpha is negative (decrease in Ne)
+    // FIXME: what we do later is check something else, arg. Add unit test as this part is tricky. Perhaps in python against numpy.random. ...
+    fn invert(&self, t1: Time, e: f64, k: f64) -> Option<Time> {
+        if self.alpha == 0.0 {
+            Some(t1 + e / (k * self.lambda_0))
+        } else {
+            let a = self.alpha;
+            let s = self.start_time;
+            let base = (a * (t1 - s)).exp();
+            let arg = e * a / (k * self.lambda_0) + base;
+            if arg <= 0.0 {
+                return None;
+            }
+            Some(s + arg.ln() / a)
+        }
+    }
+}
+
+// TODO: refactor demography into its one file demography.rs
+
 #[derive(Debug, Clone)]
 pub struct Demography {
     epochs: Vec<Epoch>,
@@ -35,6 +70,15 @@ impl Demography {
         self.epochs.len()
     }
 
+    /// End time of epoch i (start of next epoch, or infinity for the last).
+    fn epoch_end(&self, i: usize) -> Time {
+        if i + 1 < self.epochs.len() {
+            self.epochs[i + 1].start_time
+        } else {
+            f64::INFINITY
+        }
+    }
+
     fn epoch_index_at(&self, t: Time) -> usize {
         match self.epochs.binary_search_by(|e| {
             e.start_time
@@ -42,6 +86,7 @@ impl Demography {
                 .unwrap_or(std::cmp::Ordering::Less)
         }) {
             Ok(i) => i,
+            // TODO: add comment explaining i-1
             Err(i) => i - 1,
         }
     }
@@ -57,19 +102,27 @@ impl Demography {
         Ok(Self {
             epochs: vec![Epoch {
                 start_time: 0.0,
-                lambda: 1.0 / ne,
+                lambda_0: 1.0 / ne,
+                alpha: 0.0,
             }],
         })
     }
 
+    // TODO: rename to piecewise_constant_epochs
     pub fn from_tuples(epochs: &[(f64, f64)]) -> Result<Self, SMCPrimeError> {
+        let triples: Vec<(f64, f64, f64)> = epochs.iter().map(|&(t, ne)| (t, ne, 0.0)).collect();
+        Self::from_growth_tuples(&triples)
+    }
+
+    // TODO: rename to piecewise_exponential_epochs
+    pub fn from_growth_tuples(epochs: &[(f64, f64, f64)]) -> Result<Self, SMCPrimeError> {
         if epochs.is_empty() {
             return Err(SMCPrimeError::InvalidDemography(
                 "Demography must include at least one epoch".into(),
             ));
         }
 
-        let (first_time, _) = epochs[0];
+        let (first_time, _, _) = epochs[0];
         if !first_time.is_finite() || first_time != 0.0 {
             return Err(SMCPrimeError::InvalidDemography(
                 "First epoch must start at time 0".into(),
@@ -78,7 +131,7 @@ impl Demography {
 
         let mut parsed_epochs = Vec::with_capacity(epochs.len());
         let mut prev_time = f64::NEG_INFINITY;
-        for (i, &(start_time, ne)) in epochs.iter().enumerate() {
+        for (i, &(start_time, ne, alpha)) in epochs.iter().enumerate() {
             if !start_time.is_finite() {
                 return Err(SMCPrimeError::InvalidDemography(format!(
                     "Epoch start time at index {i} must be finite"
@@ -94,11 +147,23 @@ impl Demography {
                     "Epoch size at index {i} must be a positive finite number"
                 )));
             }
+            if !alpha.is_finite() {
+                return Err(SMCPrimeError::InvalidDemography(format!(
+                    "Growth rate at index {i} must be finite"
+                )));
+            }
             parsed_epochs.push(Epoch {
                 start_time,
-                lambda: 1.0 / ne,
+                lambda_0: 1.0 / ne,
+                alpha,
             });
             prev_time = start_time;
+        }
+
+        if parsed_epochs.last().expect("Not empty").alpha != 0.0 {
+            return Err(SMCPrimeError::InvalidDemography(
+                "Last epoch must have growth_rate = 0 (constant)".into(),
+            ));
         }
 
         Ok(Self {
@@ -107,33 +172,28 @@ impl Demography {
     }
 }
 
-// If we have k free lineages, we can draw waiting time
-// to the next coalescence time
+/// Draw next waiting time given $k$ free lineages at time $t_start$
 fn draw_coalescence_time(
     rng: &mut impl Rng,
     demography: &Demography,
     t_start: Time,
-    k_lineages: f64,
+    k: f64,
 ) -> f64 {
     let mut e: f64 = Exp::new(1.0).expect("rate 1.0 is valid").sample(rng);
-
     let start_idx = demography.epoch_index_at(t_start);
-    let num_epochs = demography.num_epochs();
 
-    let mut current_start = t_start;
-    for i in start_idx..num_epochs {
-        let lambda_i = demography.epochs[i].lambda;
-        let epoch_end = if i + 1 < num_epochs {
-            demography.epochs[i + 1].start_time
-        } else {
-            f64::INFINITY
-        };
-        let budget = k_lineages * lambda_i * (epoch_end - current_start);
+    let mut current_t = t_start;
+    for i in start_idx..demography.num_epochs() {
+        let epoch = &demography.epochs[i];
+        let epoch_end = demography.epoch_end(i);
+        let budget = k * epoch.cumulative_hazard(current_t, epoch_end);
         if e <= budget {
-            return current_start + e / (k_lineages * lambda_i);
+            return epoch
+                .invert(current_t, e, k)
+                .expect("Invalid coalescence time");
         }
         e -= budget;
-        current_start = epoch_end;
+        current_t = epoch_end;
     }
     unreachable!()
 }
@@ -143,58 +203,55 @@ struct CoalTree {
     num_samples: usize,
     time: Vec<Time>,
     parent: Vec<Option<NodeID>>,
-    children: Vec<Vec<NodeID>>,
-    scratch_times: Vec<f64>,
-    /// BTreeMap keyed by parent time (NotNan::new(f64::INFINITY) for the root).
+    /// `None` for leaves and dead (pruned) nodes; `Some([left, right])` for live internal nodes.
+    children: Vec<Option<[NodeID; 2]>>,
+    /// BTreeMap keyed by parent time (Inf for the root).
     /// Value: child node IDs whose branch ends at that parent time.
-    /// Enables O(k) stabbing queries: range keys > t, filter birth_time < t.
     branch_map: BTreeMap<NotNan<f64>, Vec<NodeID>>,
-    /// Maintained incrementally; updated in spr() via removed/added edge lists.
     total_branch_length: f64,
 }
 
-/// Simulate independent coalescent tree
 impl CoalTree {
     fn draw(rng: &mut impl Rng, num_samples: usize, demography: &Demography) -> Self {
         let mut time = vec![0.0; num_samples];
-        time.reserve_exact(num_samples * (num_samples - 1) / 2);
+        let num_events = num_samples * (num_samples - 1) / 2;
+        time.reserve_exact(num_events);
         let mut parent: Vec<Option<usize>> = vec![None; num_samples];
-        parent.reserve_exact(num_samples * (num_samples - 1) / 2);
-        let mut children: Vec<Vec<usize>> = vec![vec![]; num_samples];
+        parent.reserve_exact(num_events);
+        let mut children: Vec<Option<[NodeID; 2]>> = vec![None; num_samples];
 
         let mut lineages: Vec<usize> = (0..num_samples).collect();
         let mut t = 0.0;
         let mut next_id = num_samples;
 
-        while lineages.len() > 1 {
-            let k = lineages.len();
-            let rate_mult = (k * (k - 1) / 2) as f64; // C(k, 2)
-            let coal_time = draw_coalescence_time(rng, demography, t, rate_mult);
-
-            // Pick 2 distinct lineages with equal probability for every unordered pair.
-            // Sampling idx2 from [0, k-1) and then shifting it up when idx2 >= idx1
-            // is a bias-free alternative to rejection sampling: it establishes a
-            // bijection between [0, k-1) and [0, k) \ {idx1}, so every remaining
-            // index is equally likely in a single draw.
+        fn sample_pair(rng: &mut impl Rng, k: usize) -> (usize, usize) {
+            // Sample a pair of lineages in [0, k] without replacement
             let idx1 = Uniform::new(0, k).expect("valid").sample(rng);
             let mut idx2 = Uniform::new(0, k - 1).expect("valid").sample(rng);
             if idx2 >= idx1 {
                 idx2 += 1;
             }
+            (idx1, idx2)
+        }
 
+        while lineages.len() > 1 {
+            let k = lineages.len();
+            // Number of unique pairs
+            let rate_mult = (k * (k - 1) / 2) as f64;
+            // Sample coal event
+            let coal_time = draw_coalescence_time(rng, demography, t, rate_mult);
+            let (idx1, idx2) = sample_pair(rng, k);
             let lin1 = lineages[idx1];
             let lin2 = lineages[idx2];
 
-            // Create internal node
             let new_node = next_id;
             next_id += 1;
             time.push(coal_time);
             parent.push(None);
-            children.push(vec![lin1, lin2]);
+            children.push(Some([lin1, lin2]));
             parent[lin1] = Some(new_node);
             parent[lin2] = Some(new_node);
 
-            // Remove picked lineages, add new one
             let (lo, hi) = if idx1 < idx2 {
                 (idx1, idx2)
             } else {
@@ -207,21 +264,23 @@ impl CoalTree {
             t = coal_time;
         }
 
-        // Build branch_map and compute total_branch_length in one pass
+        // Initialize branch map
         let mut branch_map: BTreeMap<NotNan<f64>, Vec<NodeID>> = BTreeMap::new();
         let mut total_branch_length = 0.0;
         for i in 0..time.len() {
             match parent[i] {
                 Some(p_id) => {
                     branch_map
+                        // TODO: change to expect
                         .entry(NotNan::new(time[p_id]).unwrap())
                         .or_default()
                         .push(i);
                     total_branch_length += time[p_id] - time[i];
                 }
                 None => {
-                    if !children[i].is_empty() {
+                    if children[i].is_some() {
                         branch_map
+                            // TODO: change to expect
                             .entry(NotNan::new(f64::INFINITY).unwrap())
                             .or_default()
                             .push(i);
@@ -235,24 +294,23 @@ impl CoalTree {
             time,
             parent,
             children,
-            scratch_times: Vec::new(),
             branch_map,
             total_branch_length,
         }
     }
+
     fn total_branch_length(&self) -> f64 {
         self.total_branch_length
     }
-    /// Pick a point uniformly on the tree. Returns (node, t_recomb) where the
-    /// recombination falls on the branch from `node` to its parent.
+
+    // Picks a uniform point in the "flatenned" tree and returns the affected node and the time.
     fn uniform_point(&self, rng: &mut impl Rng) -> (NodeID, Time) {
         let mut remaining: f64 = Uniform::new(0.0, self.total_branch_length)
             .expect("valid")
             .sample(rng);
 
-        // Iterate only live edges (2n-2 entries) via branch_map, skipping the
-        // INFINITY key which holds root nodes that have no parent edge.
-        let inf_key = Self::nn(f64::INFINITY);
+        let inf_key = NotNan::new(f64::INFINITY).expect("Not nan");
+        // NOTE: this is linear, can we do better?
         for (&death_key, children) in self.branch_map.range(..inf_key) {
             let death_time = *death_key;
             for &child in children {
@@ -264,10 +322,6 @@ impl CoalTree {
             }
         }
         unreachable!()
-    }
-
-    fn nn(t: f64) -> NotNan<f64> {
-        NotNan::new(t).unwrap()
     }
 
     fn bmap_remove(map: &mut BTreeMap<NotNan<f64>, Vec<NodeID>>, key: NotNan<f64>, node: NodeID) {
@@ -286,8 +340,7 @@ impl CoalTree {
     }
 
     fn nth_branch_at_time(&self, t: f64, idx: usize) -> usize {
-        use std::ops::Bound::Excluded;
-        let t_key = Self::nn(t);
+        let t_key = NotNan::new(t).expect("Not nan");
         let mut count = 0;
         for (_, children) in self
             .branch_map
@@ -305,59 +358,46 @@ impl CoalTree {
         unreachable!("idx out of range in nth_branch_at_time")
     }
 
-    /// Draw re-coalescence time and target branch on the (original) tree.
-    /// The floating lineage starts at `t_recomb` and coalesces at rate
-    /// `n_lineages(t) * lambda(t)`.
+    /// Draw re-coalescence time and target branch using `branch_map` directly.
+    /// Each non-∞ key in branch_map is the time of a live internal node (a coalescence event).
+    /// This avoids scanning dead nodes entirely — O(num_samples) regardless of total nodes allocated.
     fn draw_recoalescence(
-        &mut self,
+        &self,
         rng: &mut impl Rng,
         demography: &Demography,
         t_recomb: f64,
     ) -> (Time, usize) {
-        // Collect and sort coalescence times of live internal nodes above t_recomb
-        self.scratch_times.clear();
-        for i in self.num_samples..self.time.len() {
-            if !self.children[i].is_empty() && self.time[i] > t_recomb {
-                self.scratch_times.push(self.time[i]);
-            }
-        }
-        self.scratch_times
-            .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let inf = NotNan::new(f64::INFINITY).expect("Not Nan");
+        let t_key = NotNan::new(t_recomb).expect("Not Nan");
 
-        // Count lineages at t_recomb
-        let mut n_lineages = self.num_samples;
-        for i in self.num_samples..self.time.len() {
-            if !self.children[i].is_empty() && self.time[i] <= t_recomb {
-                n_lineages -= 1;
-            }
-        }
+        // Count coalescences at or below t_recomb to get the lineage count
+        let n_coal_below = self.branch_map.range(..=t_key).count();
+        let mut k = self.num_samples - n_coal_below;
+
+        // Iterate coalescence events above t_recomb (already sorted by BTreeMap)
+        let mut coal_iter = self
+            .branch_map
+            .range((Excluded(t_key), Excluded(inf)))
+            .peekable();
 
         let mut e: f64 = Exp::new(1.0).expect("1.0 is valid").sample(rng);
         let mut t_start = t_recomb;
-        let mut k = n_lineages;
 
-        // Walk intervals on the fly; the last has t_end = INF (one lineage to MRCA)
-        for interval_idx in 0..=self.scratch_times.len() {
-            let t_end = if interval_idx < self.scratch_times.len() {
-                self.scratch_times[interval_idx]
-            } else {
-                Time::INFINITY
-            };
+        loop {
+            let t_end = coal_iter
+                .peek()
+                .map_or(f64::INFINITY, |(key, _)| key.into_inner());
             let rate_mult = k as f64;
+
+            // Walk demography epochs within [t_start, t_end)
             let mut current_t = t_start;
             while current_t < t_end {
                 let ei = demography.epoch_index_at(current_t);
-                let lambda = demography.epochs[ei].lambda;
-                let epoch_end = if ei + 1 < demography.epochs.len() {
-                    demography.epochs[ei + 1].start_time
-                } else {
-                    Time::INFINITY
-                };
-                let sub_end = t_end.min(epoch_end);
-                let rate = rate_mult * lambda;
-                let budget = rate * (sub_end - current_t);
+                let epoch = &demography.epochs[ei];
+                let sub_end = t_end.min(demography.epoch_end(ei));
+                let budget = rate_mult * epoch.cumulative_hazard(current_t, sub_end);
                 if e <= budget {
-                    let t_coal = current_t + e / rate;
+                    let t_coal = epoch.invert(current_t, e, rate_mult).unwrap();
                     let target_idx = Uniform::new(0, k).expect("valid").sample(rng);
                     let target = self.nth_branch_at_time(t_coal, target_idx);
                     return (t_coal, target);
@@ -365,23 +405,40 @@ impl CoalTree {
                 e -= budget;
                 current_t = sub_end;
             }
+
+            coal_iter.next();
             k -= 1;
             t_start = t_end;
         }
-        unreachable!("last interval is infinite")
     }
 
-    // The key operation is the SPR:
-    // prune `cut_node` from its parent, then regraft it at
-    // `t_coal` on `target_node`'s branch (in the post-prune tree).
-    // Returns `(removed_edges, added_edges)` where each edge is `(parent, child)`.
-    fn spr(&mut self, cut_node: usize, target_node: usize, t_coal: f64) -> (Vec<Edge>, Vec<Edge>) {
+    /// Sibling of `node` under parent `p`.
+    fn sibling(&self, p: NodeID, node: NodeID) -> NodeID {
+        let [a, b] = self.children[p].expect("parent must be live internal node");
+        if a == node { b } else { a }
+    }
+
+    /// Replace child `old` with `new` under parent `p`.
+    fn replace_child(&mut self, p: NodeID, old: NodeID, new: NodeID) {
+        let ch = self.children[p].as_mut().expect("parent must be live");
+        if ch[0] == old {
+            ch[0] = new;
+        } else {
+            ch[1] = new;
+        }
+    }
+
+    /// SPR: prune `cut_node` from its parent, regraft at `t_coal` on `target_node`'s branch.
+    /// Returns (removed_edges, added_edges) using stack-allocated ArrayVecs.
+    fn spr(
+        &mut self,
+        cut_node: usize,
+        target_node: usize,
+        t_coal: f64,
+    ) -> (ArrayVec<Edge, 4>, ArrayVec<Edge, 4>) {
         let c = cut_node;
         let p = self.parent[c].expect("cut_node has parent");
-        let s = *self.children[p]
-            .iter()
-            .find(|&&x| x != c)
-            .expect("sibling exists");
+        let s = self.sibling(p, c);
         let g = self.parent[p];
         let t = target_node;
 
@@ -389,44 +446,42 @@ impl CoalTree {
         let n = self.time.len();
         self.time.push(t_coal);
         self.parent.push(None);
-        self.children.push(vec![]);
+        self.children.push(None);
 
-        let mut removed = vec![(p, c), (p, s)];
+        let mut removed = ArrayVec::<Edge, 4>::new();
+        removed.push((p, c));
+        removed.push((p, s));
         if let Some(g_id) = g {
             removed.push((g_id, p));
         }
 
-        let mut added;
+        let mut added = ArrayVec::<Edge, 4>::new();
 
         let g_key = match g {
-            Some(g_id) => Self::nn(self.time[g_id]),
-            None => Self::nn(f64::INFINITY),
+            Some(g_id) => NotNan::new(self.time[g_id]).expect("Not Nan"),
+            None => NotNan::new(f64::INFINITY).expect("Not Nan"),
         };
-        let p_key = Self::nn(self.time[p]);
-        let n_key = Self::nn(t_coal);
+        let p_key = NotNan::new(self.time[p]).expect("Not Nan");
+        let n_key = NotNan::new(t_coal).expect("Not Nan");
 
         if t == s {
-            // Regraft lands on sibling's branch (which now spans up to g after prune)
-            // New node n replaces p structurally
+            // Regraft lands on sibling's branch
             if let Some(g_id) = g {
-                added = vec![(g_id, n), (n, s), (n, c)];
-            } else {
-                added = vec![(n, s), (n, c)];
+                added.push((g_id, n));
             }
+            added.push((n, s));
+            added.push((n, c));
 
-            // Update tree
-            self.children[p].clear();
+            self.children[p] = None;
             self.parent[p] = None;
-            self.children[n] = vec![s, c];
+            self.children[n] = Some([s, c]);
             self.parent[c] = Some(n);
             self.parent[s] = Some(n);
             self.parent[n] = g;
             if let Some(g_id) = g {
-                let pos = self.children[g_id].iter().position(|&x| x == p).unwrap();
-                self.children[g_id][pos] = n;
+                self.replace_child(g_id, p, n);
             }
 
-            // Update branch_map: p loses c and s; p removed from g; n gains c and s; n added to g
             Self::bmap_remove(&mut self.branch_map, p_key, c);
             Self::bmap_remove(&mut self.branch_map, p_key, s);
             Self::bmap_remove(&mut self.branch_map, g_key, p);
@@ -434,21 +489,19 @@ impl CoalTree {
             Self::bmap_add(&mut self.branch_map, n_key, s);
             Self::bmap_add(&mut self.branch_map, g_key, n);
         } else {
-            // General case: prune p, reconnect s to g, then insert n on t's branch
-            let q = self.parent[t]; // t's original parent (unaffected by prune since t != s)
+            // General case
+            let q = self.parent[t];
             let q_key = match q {
-                Some(q_id) => Self::nn(self.time[q_id]),
-                None => Self::nn(f64::INFINITY),
+                Some(q_id) => NotNan::new(self.time[q_id]).expect("Not Nan"),
+                None => NotNan::new(f64::INFINITY).expect("Not Nan"),
             };
 
             if let Some(q_id) = q {
                 removed.push((q_id, t));
             }
 
-            if let Some(g_id) = g {
-                added = vec![(g_id, s)];
-            } else {
-                added = vec![];
+            if let Some(_g_id) = g {
+                added.push((_g_id, s));
             }
             if let Some(q_id) = q {
                 added.push((q_id, n));
@@ -456,27 +509,23 @@ impl CoalTree {
             added.push((n, t));
             added.push((n, c));
 
-            // Update tree: prune
-            self.children[p].clear();
+            // Prune
+            self.children[p] = None;
             self.parent[p] = None;
             self.parent[s] = g;
             if let Some(g_id) = g {
-                let pos = self.children[g_id].iter().position(|&x| x == p).unwrap();
-                self.children[g_id][pos] = s;
+                self.replace_child(g_id, p, s);
             }
 
-            // Update tree: regraft
-            self.children[n] = vec![t, c];
+            // Regraft
+            self.children[n] = Some([t, c]);
             self.parent[c] = Some(n);
             self.parent[t] = Some(n);
             self.parent[n] = q;
             if let Some(q_id) = q {
-                let pos = self.children[q_id].iter().position(|&x| x == t).unwrap();
-                self.children[q_id][pos] = n;
+                self.replace_child(q_id, t, n);
             }
 
-            // Update branch_map: p loses c and s; p removed from g; t removed from q;
-            // s added to g; t and c added to n; n added to q
             Self::bmap_remove(&mut self.branch_map, p_key, c);
             Self::bmap_remove(&mut self.branch_map, p_key, s);
             Self::bmap_remove(&mut self.branch_map, g_key, p);
@@ -499,58 +548,47 @@ impl CoalTree {
 }
 
 pub fn sim_ancestry(
+    table: &mut TableCollection,
     demography: &Demography,
     num_samples: usize,
     sequence_length: f64,
     recombination_rate: f64,
     seed: u64,
-) -> Result<TableCollection, TskitError> {
-    // I think this is an adequate random seed generator for this purpose.
+) -> Result<(), TskitError> {
     let mut rng = rand::rngs::Xoshiro256PlusPlus::seed_from_u64(seed);
-    // We initialize the ARG at x=0
     let mut x = 0.0;
     let mut tree = CoalTree::draw(&mut rng, num_samples, demography);
 
-    // We have to keep track of "active" edges (i.e. those that go up to sequence_length)
-    // Open edges: (parent_node, child_node) -> left genomic position
     let mut open_edges: HashMap<(usize, usize), f64> = HashMap::new();
-    // Recorded edges: (left, right, parent_node, child_node)
     let mut edge_records: Vec<(f64, f64, usize, usize)> = Vec::new();
 
-    // Open all initial tree edges at position 0
     for i in 0..tree.time.len() {
         if let Some(p) = tree.parent[i] {
             open_edges.insert((p, i), 0.0);
         }
     }
     while x < sequence_length {
-        // This could be change to update iteratively for better performance.
-        let total_bl = tree.total_branch_length();
-        let rate = recombination_rate * total_bl;
+        let rate = recombination_rate * tree.total_branch_length();
         x += Exp::new(rate)
             .expect("Invalid coalescence rate")
             .sample(&mut rng);
         if x >= sequence_length {
             break;
         }
-        // We pick a point in the tree uniformly
         let (cut_node, t_recomb) = tree.uniform_point(&mut rng);
         let (t_coal, target_node) = tree.draw_recoalescence(&mut rng, demography, t_recomb);
-        // Healing: re-coalescence lands on the same branch that was cut
         if target_node == cut_node {
             continue;
         }
-        // If target is the parent being pruned, remap to sibling (whose branch
-        // absorbs p's range after the prune)
+        // TODO: return error or use expect
         let p = tree.parent[cut_node].unwrap();
         let effective_target = if target_node == p {
-            *tree.children[p].iter().find(|&&c| c != cut_node).unwrap()
+            tree.sibling(p, cut_node)
         } else {
             target_node
         };
 
         let (removed, added) = tree.spr(cut_node, effective_target, t_coal);
-        // Close removed edges
         for &(par, chi) in &removed {
             if let Some(left) = open_edges.remove(&(par, chi))
                 && x > left
@@ -558,19 +596,17 @@ pub fn sim_ancestry(
                 edge_records.push((left, x, par, chi));
             }
         }
-        // Open added edges
         for &(par, chi) in &added {
             open_edges.insert((par, chi), x);
         }
     }
-    // We're done!
-    // Close all remaining open edges at sequence_length
     for ((par, chi), left) in open_edges.drain() {
         if sequence_length > left {
             edge_records.push((left, sequence_length, par, chi));
         }
     }
-    let mut table = TableCollection::new(sequence_length)?;
+
+    // Write to table collection
     let population = table.add_population()?;
     let defaults = tskit::NodeDefaults {
         population,
@@ -598,137 +634,25 @@ pub fn sim_ancestry(
 
     table.full_sort(TableSortOptions::default())?;
     table.build_index()?;
-    Ok(table)
-}
-
-pub fn sim_ancestry_variable<C>(
-    interpolator: C,
-    num_samples: usize,
-    sequence_length: f64,
-    recombination_rate: f64,
-    seed: u64,
-) -> Result<TableCollection, TskitError>
-where
-    C: Curve<f64, Output = f64>,
-{
-    // I think this is an adequate random seed generator for this purpose.
-    let mut rng = rand::rngs::Xoshiro256PlusPlus::seed_from_u64(seed);
-    // We initialize the ARG at x=0
-    let mut x = 0.0;
-    // Evaluate demography at genomic position x
-    let demography = |x: f64| -> Demography {
-        Demography::constant(interpolator.eval(x)).expect("interpolated Ne must be positive")
-    };
-    let mut tree = CoalTree::draw(&mut rng, num_samples, &demography(x));
-
-    // We have to keep track of "active" edges (i.e. those that go up to sequence_length)
-    // Open edges: (parent_node, child_node) -> left genomic position
-    let mut open_edges: HashMap<(usize, usize), f64> = HashMap::new();
-    // Recorded edges: (left, right, parent_node, child_node)
-    let mut edge_records: Vec<(f64, f64, usize, usize)> = Vec::new();
-
-    // Open all initial tree edges at position 0
-    for i in 0..tree.time.len() {
-        if let Some(p) = tree.parent[i] {
-            open_edges.insert((p, i), 0.0);
-        }
-    }
-    while x < sequence_length {
-        // This could be change to update iteratively for better performance.
-        let total_bl = tree.total_branch_length();
-        let rate = recombination_rate * total_bl;
-        x += Exp::new(rate)
-            .expect("Invalid coalescence rate")
-            .sample(&mut rng);
-        if x >= sequence_length {
-            break;
-        }
-        // We pick a point in the tree uniformly
-        let (cut_node, t_recomb) = tree.uniform_point(&mut rng);
-        let (t_coal, target_node) = tree.draw_recoalescence(&mut rng, &demography(x), t_recomb);
-        // Healing: re-coalescence lands on the same branch that was cut
-        if target_node == cut_node {
-            continue;
-        }
-        // If target is the parent being pruned, remap to sibling (whose branch
-        // absorbs p's range after the prune)
-        let p = tree.parent[cut_node].unwrap();
-        let effective_target = if target_node == p {
-            *tree.children[p].iter().find(|&&c| c != cut_node).unwrap()
-        } else {
-            target_node
-        };
-
-        let (removed, added) = tree.spr(cut_node, effective_target, t_coal);
-        // Close removed edges
-        for &(par, chi) in &removed {
-            if let Some(left) = open_edges.remove(&(par, chi))
-                && x > left
-            {
-                edge_records.push((left, x, par, chi));
-            }
-        }
-        // Open added edges
-        for &(par, chi) in &added {
-            open_edges.insert((par, chi), x);
-        }
-    }
-    // We're done!
-    // Close all remaining open edges at sequence_length
-    for ((par, chi), left) in open_edges.drain() {
-        if sequence_length > left {
-            edge_records.push((left, sequence_length, par, chi));
-        }
-    }
-    let mut table = TableCollection::new(sequence_length)?;
-    let population = table.add_population()?;
-    let defaults = tskit::NodeDefaults {
-        population,
-        ..Default::default()
-    };
-    let sample_defaults = tskit::NodeDefaults {
-        flags: tskit::NodeFlags::new_sample(),
-        population,
-        ..Default::default()
-    };
-
-    let mut node_ids = Vec::new();
-    for i in 0..tree.time.len() {
-        let nid = if i < num_samples {
-            table.add_node_with_defaults(0.0, &sample_defaults)?
-        } else {
-            table.add_node_with_defaults(tree.time[i], &defaults)?
-        };
-        node_ids.push(nid);
-    }
-
-    for &(left, right, par, chi) in &edge_records {
-        table.add_edge(left, right, node_ids[par], node_ids[chi])?;
-    }
-
-    table.full_sort(TableSortOptions::default())?;
-    table.build_index()?;
-    Ok(table)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enterpolation::linear::Linear;
     use proptest::prelude::*;
 
-    /// Generate a valid piecewise-constant demography. Epoch boundaries are
-    /// derived from cumulative sums of positive gaps so they are always
-    /// strictly increasing and start at 0, satisfying the invariant assumed by
-    /// `epoch_index_at`.
     fn arb_demography() -> impl Strategy<Value = Demography> {
         (1usize..=10usize)
             .prop_flat_map(|n| {
                 let gaps = proptest::collection::vec(1.0f64..=500.0f64, n - 1);
                 let lambdas = proptest::collection::vec(0.1f64..=10.0f64, n);
-                (gaps, lambdas)
+                let alphas = proptest::collection::vec(-0.02f64..=0.02f64, n);
+                (gaps, lambdas, alphas)
             })
-            .prop_map(|(gaps, lambdas)| {
+            .prop_map(|(gaps, lambdas, mut alphas)| {
+                // Last epoch must be constant to guarantee coalescence
+                *alphas.last_mut().unwrap() = 0.0;
                 let mut times = vec![0.0f64];
                 for g in &gaps {
                     times.push(times.last().unwrap() + g);
@@ -737,9 +661,11 @@ mod tests {
                     epochs: times
                         .into_iter()
                         .zip(lambdas)
-                        .map(|(t, lambda)| Epoch {
+                        .zip(alphas)
+                        .map(|((t, lambda), alpha)| Epoch {
                             start_time: t,
-                            lambda,
+                            lambda_0: lambda,
+                            alpha,
                         })
                         .collect(),
                 }
@@ -756,20 +682,19 @@ mod tests {
             let mut rng = rand::rngs::Xoshiro256PlusPlus::seed_from_u64(seed);
             let tree = CoalTree::draw(&mut rng, num_samples, &demography);
 
-            // A binary coalescent for n samples produces exactly 2n-1 nodes
             prop_assert_eq!(tree.time.len(), 2 * num_samples - 1);
 
-            // Exactly one root — the MRCA
             let n_roots = tree.parent.iter().filter(|p| p.is_none()).count();
             prop_assert_eq!(n_roots, 1);
 
-            // Every internal node is binary
             for i in num_samples..tree.time.len() {
-                prop_assert_eq!(tree.children[i].len(), 2,
-                    "internal node {} has {} children", i, tree.children[i].len());
+                let ch = tree.children[i];
+                prop_assert!(ch.is_some(),
+                    "internal node {} must have children", i);
+                prop_assert_eq!(ch.unwrap().len(), 2,
+                    "internal node {} must be binary", i);
             }
 
-            // Parent times are strictly greater than child times (ultrametricity)
             for i in 0..tree.time.len() {
                 if let Some(p) = tree.parent[i] {
                     prop_assert!(tree.time[p] > tree.time[i],
@@ -783,19 +708,10 @@ mod tests {
             num_samples in 2usize..=50,
             demography in arb_demography(),
         ) {
-            let _arg = sim_ancestry(
-                &demography, num_samples, 1.0, 1.0, seed
+            let mut table = TableCollection::new(1.0).unwrap();
+            sim_ancestry(
+                &mut table, &demography, num_samples, 1.0, 1.0, seed
             ).unwrap();
         }
-    }
-
-    #[test]
-    fn sim_ancestry_variable_accepts_constant_linear_interpolator() {
-        let interpolator = Linear::builder()
-            .elements([1.0, 1.0])
-            .knots([0.0, 1.0])
-            .build()
-            .unwrap();
-        assert!(sim_ancestry_variable(interpolator, 2, 1.0, 1.0, 1234).is_ok());
     }
 }

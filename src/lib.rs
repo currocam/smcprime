@@ -1,18 +1,62 @@
 use pyo3::prelude::*;
-/// Implements pointer conversions between Rust and Python tskit objects
-mod ffi;
-/// Implements SMC++ simulations
+
+/// Implements SMC' simulations
 mod simulations;
 
 /// A Python module implemented in Rust.
 #[pymodule]
 mod smc_prime {
-    use enterpolation::linear::Linear;
     use pyo3::exceptions::PyRuntimeError;
     use pyo3::prelude::*;
 
-    use crate::ffi;
     use crate::simulations;
+
+    /// Parse an msprime.Demography object into our Demography via attribute access.
+    fn parse_msprime_demography(demo: &Bound<'_, PyAny>) -> PyResult<simulations::Demography> {
+        let pops = demo.getattr("populations")?;
+        let num_pops: usize = pops.len()?;
+        if num_pops != 1 {
+            return Err(PyRuntimeError::new_err(format!(
+                "smc_prime only supports single-population models, got {num_pops} populations"
+            )));
+        }
+
+        // Check migration matrix for non-zero entries
+        let mig_matrix = demo.getattr("migration_matrix")?;
+        let flat: Vec<f64> = mig_matrix
+            .call_method0("flatten")?
+            .call_method0("tolist")?
+            .extract()?;
+        if flat.iter().any(|&x| x != 0.0) {
+            return Err(PyRuntimeError::new_err(
+                "smc_prime does not support migration; all migration rates must be zero",
+            ));
+        }
+
+        // Extract initial population parameters
+        let pop0 = pops.get_item(0)?;
+        let init_size: f64 = pop0.getattr("initial_size")?.extract()?;
+        let init_growth: f64 = pop0.getattr("growth_rate")?.extract()?;
+
+        let mut epoch_tuples: Vec<(f64, f64, f64)> = vec![(0.0, init_size, init_growth)];
+
+        // Collect PopulationParametersChange events
+        let events = demo.getattr("events")?;
+        for event in events.try_iter()? {
+            let event: Bound<'_, PyAny> = event?;
+            let type_name: String = event.get_type().getattr("__name__")?.extract()?;
+            if type_name == "PopulationParametersChange" {
+                let time: f64 = event.getattr("time")?.extract()?;
+                let size: f64 = event.getattr("initial_size")?.extract()?;
+                let growth: f64 = event.getattr("growth_rate")?.extract().unwrap_or(0.0);
+                epoch_tuples.push((time, size, growth));
+            }
+        }
+
+        epoch_tuples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        simulations::Demography::from_growth_tuples(&epoch_tuples)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
 
     /// Run SMC' algorithm
     #[pyfunction]
@@ -32,89 +76,47 @@ mod smc_prime {
         let demography = if let Ok(ne) = population_size.extract::<f64>() {
             simulations::Demography::constant(ne)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        } else if let Ok(triples) = population_size.extract::<Vec<(f64, f64, f64)>>() {
+            simulations::Demography::from_growth_tuples(&triples)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         } else if let Ok(pairs) = population_size.extract::<Vec<(f64, f64)>>() {
             simulations::Demography::from_tuples(&pairs)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        } else if population_size.getattr("populations").is_ok() {
+            parse_msprime_demography(population_size)?
         } else {
             return Err(PyRuntimeError::new_err(
-                "population_size must be a number or a list of (time, size) tuples",
+                "population_size must be a number, a list of (time, size[, growth_rate]) tuples, \
+                 or an msprime.Demography object",
             ));
         };
-        let tables = simulations::sim_ancestry(
-            &demography,
-            num_samples,
-            sequence_length.unwrap_or(1.0),
-            recombination_rate.unwrap_or(0.0),
-            random_seed,
-        )
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        ffi::table_collection_into_python_tree_sequence(py, tables)
-    }
-
-    /// Run SMC' algorithm with variable Ne
-    #[pyfunction]
-    #[pyo3(signature = (population_size_fn, num_samples=2, sequence_length=1.0, recombination_rate=1.0, random_seed=None, granularity=None))]
-    pub fn sim_ancestry_variable(
-        py: Python<'_>,
-        population_size_fn: &Bound<'_, PyAny>,
-        num_samples: usize,
-        sequence_length: Option<f64>,
-        recombination_rate: Option<f64>,
-        random_seed: Option<u64>,
-        granularity: Option<usize>,
-    ) -> PyResult<Py<PyAny>> {
-        if !population_size_fn.is_callable() {
-            return Err(PyRuntimeError::new_err(
-                "population_size_fn must be a callable taking one position argument",
-            ));
-        }
-        if num_samples < 2 {
-            return Err(PyRuntimeError::new_err("num_samples must be at least 2"));
-        }
 
         let sequence_length = sequence_length.unwrap_or(1.0);
-        if !sequence_length.is_finite() || sequence_length <= 0.0 {
-            return Err(PyRuntimeError::new_err(
-                "sequence_length must be a positive finite float",
-            ));
-        }
-        let granularity = granularity.unwrap_or(1000).max(2);
-        let step = sequence_length / (granularity - 1) as f64;
+        let recombination_rate = recombination_rate.unwrap_or(0.0);
 
-        let mut xs = Vec::with_capacity(granularity);
-        let mut nes = Vec::with_capacity(granularity);
-        for i in 0..granularity {
-            let x = i as f64 * step;
-            let ne = population_size_fn
-                .call1((x,))?
-                .extract::<f64>()
-                .map_err(|_| {
-                    PyRuntimeError::new_err(
-                        "population_size_fn(position) must return a positive finite float",
-                    )
-                })?;
-            if !ne.is_finite() || ne <= 0.0 {
-                return Err(PyRuntimeError::new_err(
-                    "population_size_fn(position) must return a positive finite float",
-                ));
-            }
-            xs.push(x);
-            nes.push(ne);
-        }
-
-        let lin = Linear::builder()
-            .elements(nes)
-            .knots(xs)
-            .build()
+        let mut shared = tskit2tskit::SharedTableCollection::new(py, sequence_length)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let tables = simulations::sim_ancestry_variable(
-            lin,
-            num_samples,
-            sequence_length,
-            recombination_rate.unwrap_or(0.0),
-            random_seed.unwrap_or_else(rand::random),
-        )
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        ffi::table_collection_into_python_tree_sequence(py, tables)
+
+        py.detach(|| -> Result<(), PyErr> {
+            // SAFETY: safe if tskit-rust and tskit-python share the same
+            // tsk_table_collection_t layout (same tskit-c version).
+            Ok(unsafe {
+                shared.with_mut_tables(|tables| -> Result<(), tskit2tskit::Error> {
+                    simulations::sim_ancestry(
+                        tables,
+                        &demography,
+                        num_samples,
+                        sequence_length,
+                        recombination_rate,
+                        random_seed,
+                    )?;
+                    Ok(())
+                })
+            }?)
+        })?;
+
+        Ok(shared
+            .into_python_tree_sequence(py)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?)
     }
 }

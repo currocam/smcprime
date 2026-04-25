@@ -119,7 +119,7 @@ def test_sim_ancestry_matches_diversity_expectations_piecewise():
     assert np.abs((np.mean(ms_num_trees) - np.mean(num_trees))) < np.std(ms_num_trees)
 
 
-def test_sim_ancestry_accepts_piecewise_haploid_ne():
+def test_sim_ancestry_accepts_piecewise():
     ts_const = smc_prime.sim_ancestry(
         population_size=100,
         num_samples=8,
@@ -140,19 +140,8 @@ def test_sim_ancestry_accepts_piecewise_haploid_ne():
     )
 
 
-def test_sim_ancestry_rejects_invalid_piecewise_haploid_ne():
+def test_sim_ancestry_rejects_invalid_piecewise():
     with pytest.raises(RuntimeError, match="First epoch must start at time 0"):
         smc_prime.sim_ancestry(
             population_size=[(1.0, 100.0)], num_samples=2, random_seed=1
         )
-
-
-def test_sim_ancestry_variable_returns_tree_sequence_with_constant_callable():
-    ts = smc_prime.sim_ancestry_variable(
-        population_size_fn=lambda x: 1000,
-        num_samples=10,
-        recombination_rate=1.0,
-        sequence_length=10.0,
-    )
-    assert isinstance(ts, tskit.TreeSequence)
-    assert ts.num_samples == 10
