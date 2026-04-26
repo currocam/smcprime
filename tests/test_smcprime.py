@@ -10,8 +10,10 @@ from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 from hypothesis import given, settings, strategies as st
 
+
 def _parallel_map(values, fn):
     return Parallel(n_jobs=-1, prefer="threads")(delayed(fn)(value) for value in values)
+
 
 def compare_simulators(
     population_size,
@@ -66,11 +68,16 @@ def compare_simulators(
 
     # Two-sample t-test for diversity
     stat_div, pval_div = stats.ttest_ind(diversity, ms_diversity, equal_var=False)
-    assert pval_div > alpha, f"Diversity means differ significantly: smc_prime={np.mean(diversity):.4f}, msprime={np.mean(ms_diversity):.4f} (p={pval_div:.4e})"
+    assert pval_div > alpha, (
+        f"Diversity means differ significantly: smc_prime={np.mean(diversity):.4f}, msprime={np.mean(ms_diversity):.4f} (p={pval_div:.4e})"
+    )
 
     # Two-sample t-test for num_trees
     stat_trees, pval_trees = stats.ttest_ind(num_trees, ms_num_trees, equal_var=False)
-    assert pval_trees > alpha, f"Tree count means differ significantly: smc_prime={np.mean(num_trees):.1f}, msprime={np.mean(ms_num_trees):.1f} (p={pval_trees:.4e})"
+    assert pval_trees > alpha, (
+        f"Tree count means differ significantly: smc_prime={np.mean(num_trees):.1f}, msprime={np.mean(ms_num_trees):.1f} (p={pval_trees:.4e})"
+    )
+
 
 def test_sim_ancestry_returns_tree_sequence():
     ts = smc_prime.sim_ancestry(
@@ -102,6 +109,7 @@ def test_sim_ancestry_matches_diversity_expectations_constant():
         alpha=0.01,
     )
 
+
 def test_sim_ancestry_matches_diversity_expectations_piecewise():
     demo = msprime.Demography()
     demo.add_population(name="pop_0", initial_size=100.0)
@@ -127,7 +135,9 @@ def test_sim_ancestry_matches_diversity_expectations_exponential_growth():
 
     demo = msprime.Demography()
     demo.add_population(name="pop_0", initial_size=N0, growth_rate=alpha)
-    demo.add_population_parameters_change(time=t_change, initial_size=N_change, growth_rate=0.0)
+    demo.add_population_parameters_change(
+        time=t_change, initial_size=N_change, growth_rate=0.0
+    )
 
     compare_simulators(
         population_size=[(0.0, N0, alpha), (t_change, N_change, 0.0)],
@@ -139,6 +149,7 @@ def test_sim_ancestry_matches_diversity_expectations_exponential_growth():
         alpha=0.01,
     )
 
+
 def test_sim_ancestry_matches_diversity_expectations_exponential_decline():
     growth_rate = -0.005
     t_change = 50.0
@@ -148,7 +159,9 @@ def test_sim_ancestry_matches_diversity_expectations_exponential_decline():
 
     demo = msprime.Demography()
     demo.add_population(name="pop_0", initial_size=N0, growth_rate=growth_rate)
-    demo.add_population_parameters_change(time=t_change, initial_size=N_change, growth_rate=0.0)
+    demo.add_population_parameters_change(
+        time=t_change, initial_size=N_change, growth_rate=0.0
+    )
 
     compare_simulators(
         population_size=[(0.0, N0, growth_rate), (t_change, N_change, 0.0)],
@@ -160,10 +173,13 @@ def test_sim_ancestry_matches_diversity_expectations_exponential_decline():
         alpha=0.01,
     )
 
+
 @settings(deadline=None, max_examples=50)
 @given(
     ne=st.floats(min_value=1e-3, max_value=1e6, allow_nan=False, allow_infinity=False),
-    recombination_rate=st.floats(min_value=0.0, max_value=10.0, allow_nan=False, allow_infinity=False),
+    recombination_rate=st.floats(
+        min_value=0.0, max_value=10.0, allow_nan=False, allow_infinity=False
+    ),
 )
 def test_hypothesis_constant_robustness(ne, recombination_rate):
     ts = smc_prime.sim_ancestry(
@@ -176,15 +192,17 @@ def test_hypothesis_constant_robustness(ne, recombination_rate):
     assert isinstance(ts, tskit.TreeSequence)
     assert ts.num_samples == 5
     assert ts.sequence_length == 1.0
-    
+
+
 @settings(deadline=None, max_examples=50)
 @given(
     epochs=st.lists(
         st.tuples(
-            st.floats(min_value=1e-3, max_value=1e5), # ne
-            st.floats(min_value=-0.5, max_value=0.5)  # alpha
+            st.floats(min_value=1e-3, max_value=1e5),  # ne
+            st.floats(min_value=-0.5, max_value=0.5),  # alpha
         ),
-        min_size=1, max_size=5
+        min_size=1,
+        max_size=5,
     )
 )
 def test_hypothesis_piecewise_exponential_robustness(epochs):
@@ -192,11 +210,11 @@ def test_hypothesis_piecewise_exponential_robustness(epochs):
     times = [0.0]
     for i in range(1, len(epochs)):
         times.append(times[-1] + np.random.uniform(0.1, 10.0))
-        
+
     pop_size = []
     for t, (ne, alpha) in zip(times, epochs):
         pop_size.append((t, ne, alpha))
-        
+
     # Ensure last epoch has 0 alpha
     pop_size[-1] = (pop_size[-1][0], pop_size[-1][1], 0.0)
 
