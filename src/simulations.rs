@@ -1,4 +1,4 @@
-use crate::demography::{Demography, Epoch, Time};
+use crate::demography::{Demography, Time};
 use arrayvec::ArrayVec;
 use ordered_float::NotNan;
 use rand::prelude::*;
@@ -10,27 +10,25 @@ use tskit::{TableCollection, TableSortOptions, TskitError};
 pub type NodeID = usize;
 pub type Edge = (NodeID, NodeID);
 
-/// Draw next waiting time given $k$ free lineages at time $t_start$
+/// Draw coalescence time for `k` lineages starting at `t_start`.
+/// Uses fresh Exp(1) draws per epoch (memoryless property), matching msprime's approach.
 fn draw_coalescence_time(
     rng: &mut impl Rng,
     demography: &Demography,
     t_start: Time,
     k: f64,
 ) -> f64 {
-    let mut e: f64 = Exp::new(1.0).expect("rate 1.0 is valid").sample(rng);
     let start_idx = demography.epoch_index_at(t_start);
-
     let mut current_t = t_start;
     for i in start_idx..demography.num_epochs() {
         let epoch = &demography.epochs[i];
         let epoch_end = demography.epoch_end(i);
-        let budget = k * epoch.cumulative_hazard(current_t, epoch_end);
-        if e <= budget {
-            return epoch
-                .invert(current_t, e, k)
-                .expect("Invalid coalescence time");
+        let e: f64 = Exp::new(1.0).expect("rate 1.0 is valid").sample(rng);
+        if let Some(t_coal) = epoch.invert(current_t, e, k) {
+            if t_coal <= epoch_end {
+                return t_coal;
+            }
         }
-        e -= budget;
         current_t = epoch_end;
     }
     unreachable!()
@@ -146,9 +144,6 @@ impl CoalTree {
             .sample(rng);
 
         let inf_key = NotNan::new(f64::INFINITY).expect("Not nan");
-        // NOTE: this is linear, can we do better?
-        // A potential optimization would involve a fenwick tree over branch length weights,
-        // allowing O(log N) lookup. Since max N is usually small, linear scan over branch map is fine for now.
         for (&death_key, children) in self.branch_map.range(..inf_key) {
             let death_time = *death_key;
             for &child in children {
@@ -218,7 +213,6 @@ impl CoalTree {
             .range((Excluded(t_key), Excluded(inf)))
             .peekable();
 
-        let mut e: f64 = Exp::new(1.0).expect("1.0 is valid").sample(rng);
         let mut t_start = t_recomb;
 
         loop {
@@ -227,20 +221,20 @@ impl CoalTree {
                 .map_or(f64::INFINITY, |(key, _)| key.into_inner());
             let rate_mult = k as f64;
 
-            // Walk demography epochs within [t_start, t_end)
+            // Walk demography epochs within [t_start, t_end), fresh Exp(1) per sub-interval
             let mut current_t = t_start;
             while current_t < t_end {
                 let ei = demography.epoch_index_at(current_t);
                 let epoch = &demography.epochs[ei];
                 let sub_end = t_end.min(demography.epoch_end(ei));
-                let budget = rate_mult * epoch.cumulative_hazard(current_t, sub_end);
-                if e <= budget {
-                    let t_coal = epoch.invert(current_t, e, rate_mult).expect("valid time");
-                    let target_idx = Uniform::new(0, k).expect("valid").sample(rng);
-                    let target = self.nth_branch_at_time(t_coal, target_idx);
-                    return (t_coal, target);
+                let e: f64 = Exp::new(1.0).expect("1.0 is valid").sample(rng);
+                if let Some(t_coal) = epoch.invert(current_t, e, rate_mult) {
+                    if t_coal <= sub_end {
+                        let target_idx = Uniform::new(0, k).expect("valid").sample(rng);
+                        let target = self.nth_branch_at_time(t_coal, target_idx);
+                        return (t_coal, target);
+                    }
                 }
-                e -= budget;
                 current_t = sub_end;
             }
 
@@ -477,6 +471,7 @@ pub fn sim_ancestry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::demography::Epoch;
     use proptest::prelude::*;
 
     fn arb_demography() -> impl Strategy<Value = Demography> {

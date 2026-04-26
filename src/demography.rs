@@ -17,23 +17,14 @@ pub struct Epoch {
 }
 
 impl Epoch {
-    /// Cumulative hazard integral from t1 to t2 (unit rate multiplier).
-    pub fn cumulative_hazard(&self, t1: Time, t2: Time) -> f64 {
-        if self.alpha == 0.0 {
-            self.lambda_start * (t2 - t1)
-        } else {
-            let a = self.alpha;
-            let s = self.start_time;
-            // Using expm1 for better numerical stability when a*(t-s) is small:
-            // e^(x) - e^(y) = e^x - 1 - (e^y - 1) = expm1(x) - expm1(y)
-            (self.lambda_start / a) * ((a * (t2 - s)).exp_m1() - (a * (t1 - s)).exp_m1())
-        }
+    fn is_constant(&self) -> bool {
+        self.alpha.abs() < f64::EPSILON
     }
 
     /// Invert the cumulative hazard: find t_coal > t1 such that k * H(t1, t_coal) = e.
     /// Returns None if coalescence cannot happen in this epoch (when the accumulated hazard is insufficient).
     pub fn invert(&self, t1: Time, e: f64, k: f64) -> Option<Time> {
-        if self.alpha == 0.0 {
+        if self.is_constant() {
             Some(t1 + e / (k * self.lambda_start))
         } else {
             let a = self.alpha;
