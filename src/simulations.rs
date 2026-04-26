@@ -1,176 +1,14 @@
+use crate::demography::{Demography, Epoch, Time};
 use arrayvec::ArrayVec;
 use ordered_float::NotNan;
 use rand::prelude::*;
 use rand_distr::{Exp, Uniform};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::Excluded;
-use thiserror::Error;
 use tskit::{TableCollection, TableSortOptions, TskitError};
 
-type Time = f64;
-type NodeID = usize;
-type Edge = (NodeID, NodeID);
-
-#[derive(Debug, Error)]
-pub enum SMCPrimeError {
-    #[error("Invalid demography: {0}")]
-    InvalidDemography(String),
-}
-
-#[derive(Debug, Clone)]
-struct Epoch {
-    start_time: Time,
-    // TODO: rename into lambda_start
-    lambda_0: f64, // 1/N0 at epoch start
-    alpha: f64,    // growth rate (0.0 = constant)
-}
-
-impl Epoch {
-    /// Cumulative hazard integral from t1 to t2 (unit rate multiplier).
-    fn cumulative_hazard(&self, t1: Time, t2: Time) -> f64 {
-        if self.alpha == 0.0 {
-            self.lambda_0 * (t2 - t1)
-        } else {
-            let a = self.alpha;
-            let s = self.start_time;
-            // TODO: can we do this numerically more robust?
-            (self.lambda_0 / a) * ((a * (t2 - s)).exp() - (a * (t1 - s)).exp())
-        }
-    }
-
-    /// Invert the cumulative hazard: find t_coal > t1 such that k * H(t1, t_coal) = e.
-    /// Returns None if coalescence cannot happen in this epoch (alpha < 0, integral converges).
-    // FIXME: previous line is incorrect. We cannot ignore when alpha is negative (decrease in Ne)
-    // FIXME: what we do later is check something else, arg. Add unit test as this part is tricky. Perhaps in python against numpy.random. ...
-    fn invert(&self, t1: Time, e: f64, k: f64) -> Option<Time> {
-        if self.alpha == 0.0 {
-            Some(t1 + e / (k * self.lambda_0))
-        } else {
-            let a = self.alpha;
-            let s = self.start_time;
-            let base = (a * (t1 - s)).exp();
-            let arg = e * a / (k * self.lambda_0) + base;
-            if arg <= 0.0 {
-                return None;
-            }
-            Some(s + arg.ln() / a)
-        }
-    }
-}
-
-// TODO: refactor demography into its one file demography.rs
-
-#[derive(Debug, Clone)]
-pub struct Demography {
-    epochs: Vec<Epoch>,
-}
-
-impl Demography {
-    fn num_epochs(&self) -> usize {
-        self.epochs.len()
-    }
-
-    /// End time of epoch i (start of next epoch, or infinity for the last).
-    fn epoch_end(&self, i: usize) -> Time {
-        if i + 1 < self.epochs.len() {
-            self.epochs[i + 1].start_time
-        } else {
-            f64::INFINITY
-        }
-    }
-
-    fn epoch_index_at(&self, t: Time) -> usize {
-        match self.epochs.binary_search_by(|e| {
-            e.start_time
-                .partial_cmp(&t)
-                .unwrap_or(std::cmp::Ordering::Less)
-        }) {
-            Ok(i) => i,
-            // TODO: add comment explaining i-1
-            Err(i) => i - 1,
-        }
-    }
-}
-
-impl Demography {
-    pub fn constant(ne: f64) -> Result<Self, SMCPrimeError> {
-        if ne <= 0.0 {
-            return Err(SMCPrimeError::InvalidDemography(
-                "Population size must be positive".into(),
-            ));
-        }
-        Ok(Self {
-            epochs: vec![Epoch {
-                start_time: 0.0,
-                lambda_0: 1.0 / ne,
-                alpha: 0.0,
-            }],
-        })
-    }
-
-    // TODO: rename to piecewise_constant_epochs
-    pub fn from_tuples(epochs: &[(f64, f64)]) -> Result<Self, SMCPrimeError> {
-        let triples: Vec<(f64, f64, f64)> = epochs.iter().map(|&(t, ne)| (t, ne, 0.0)).collect();
-        Self::from_growth_tuples(&triples)
-    }
-
-    // TODO: rename to piecewise_exponential_epochs
-    pub fn from_growth_tuples(epochs: &[(f64, f64, f64)]) -> Result<Self, SMCPrimeError> {
-        if epochs.is_empty() {
-            return Err(SMCPrimeError::InvalidDemography(
-                "Demography must include at least one epoch".into(),
-            ));
-        }
-
-        let (first_time, _, _) = epochs[0];
-        if !first_time.is_finite() || first_time != 0.0 {
-            return Err(SMCPrimeError::InvalidDemography(
-                "First epoch must start at time 0".into(),
-            ));
-        }
-
-        let mut parsed_epochs = Vec::with_capacity(epochs.len());
-        let mut prev_time = f64::NEG_INFINITY;
-        for (i, &(start_time, ne, alpha)) in epochs.iter().enumerate() {
-            if !start_time.is_finite() {
-                return Err(SMCPrimeError::InvalidDemography(format!(
-                    "Epoch start time at index {i} must be finite"
-                )));
-            }
-            if i > 0 && start_time <= prev_time {
-                return Err(SMCPrimeError::InvalidDemography(
-                    "Epoch start times must be strictly increasing".into(),
-                ));
-            }
-            if !ne.is_finite() || ne <= 0.0 {
-                return Err(SMCPrimeError::InvalidDemography(format!(
-                    "Epoch size at index {i} must be a positive finite number"
-                )));
-            }
-            if !alpha.is_finite() {
-                return Err(SMCPrimeError::InvalidDemography(format!(
-                    "Growth rate at index {i} must be finite"
-                )));
-            }
-            parsed_epochs.push(Epoch {
-                start_time,
-                lambda_0: 1.0 / ne,
-                alpha,
-            });
-            prev_time = start_time;
-        }
-
-        if parsed_epochs.last().expect("Not empty").alpha != 0.0 {
-            return Err(SMCPrimeError::InvalidDemography(
-                "Last epoch must have growth_rate = 0 (constant)".into(),
-            ));
-        }
-
-        Ok(Self {
-            epochs: parsed_epochs,
-        })
-    }
-}
+pub type NodeID = usize;
+pub type Edge = (NodeID, NodeID);
 
 /// Draw next waiting time given $k$ free lineages at time $t_start$
 fn draw_coalescence_time(
@@ -271,8 +109,7 @@ impl CoalTree {
             match parent[i] {
                 Some(p_id) => {
                     branch_map
-                        // TODO: change to expect
-                        .entry(NotNan::new(time[p_id]).unwrap())
+                        .entry(NotNan::new(time[p_id]).expect("Not NaN"))
                         .or_default()
                         .push(i);
                     total_branch_length += time[p_id] - time[i];
@@ -280,8 +117,7 @@ impl CoalTree {
                 None => {
                     if children[i].is_some() {
                         branch_map
-                            // TODO: change to expect
-                            .entry(NotNan::new(f64::INFINITY).unwrap())
+                            .entry(NotNan::new(f64::INFINITY).expect("Not NaN"))
                             .or_default()
                             .push(i);
                     }
@@ -311,6 +147,8 @@ impl CoalTree {
 
         let inf_key = NotNan::new(f64::INFINITY).expect("Not nan");
         // NOTE: this is linear, can we do better?
+        // A potential optimization would involve a fenwick tree over branch length weights,
+        // allowing O(log N) lookup. Since max N is usually small, linear scan over branch map is fine for now.
         for (&death_key, children) in self.branch_map.range(..inf_key) {
             let death_time = *death_key;
             for &child in children {
@@ -397,7 +235,7 @@ impl CoalTree {
                 let sub_end = t_end.min(demography.epoch_end(ei));
                 let budget = rate_mult * epoch.cumulative_hazard(current_t, sub_end);
                 if e <= budget {
-                    let t_coal = epoch.invert(current_t, e, rate_mult).unwrap();
+                    let t_coal = epoch.invert(current_t, e, rate_mult).expect("valid time");
                     let target_idx = Uniform::new(0, k).expect("valid").sample(rng);
                     let target = self.nth_branch_at_time(t_coal, target_idx);
                     return (t_coal, target);
@@ -580,8 +418,7 @@ pub fn sim_ancestry(
         if target_node == cut_node {
             continue;
         }
-        // TODO: return error or use expect
-        let p = tree.parent[cut_node].unwrap();
+        let p = tree.parent[cut_node].expect("cut node must have a parent");
         let effective_target = if target_node == p {
             tree.sibling(p, cut_node)
         } else {
@@ -664,7 +501,7 @@ mod tests {
                         .zip(alphas)
                         .map(|((t, lambda), alpha)| Epoch {
                             start_time: t,
-                            lambda_0: lambda,
+                            lambda_start: lambda,
                             alpha,
                         })
                         .collect(),

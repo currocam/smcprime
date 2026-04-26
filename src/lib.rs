@@ -1,5 +1,8 @@
 use pyo3::prelude::*;
 
+/// Demography model.
+mod demography;
+
 /// Implements SMC' simulations
 mod simulations;
 
@@ -9,10 +12,11 @@ mod smc_prime {
     use pyo3::exceptions::PyRuntimeError;
     use pyo3::prelude::*;
 
+    use crate::demography;
     use crate::simulations;
 
     /// Parse an msprime.Demography object into our Demography via attribute access.
-    fn parse_msprime_demography(demo: &Bound<'_, PyAny>) -> PyResult<simulations::Demography> {
+    fn parse_msprime_demography(demo: &Bound<'_, PyAny>) -> PyResult<demography::Demography> {
         let pops = demo.getattr("populations")?;
         let num_pops: usize = pops.len()?;
         if num_pops != 1 {
@@ -54,7 +58,7 @@ mod smc_prime {
         }
 
         epoch_tuples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        simulations::Demography::from_growth_tuples(&epoch_tuples)
+        demography::Demography::piecewise_exponential_epochs(&epoch_tuples)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -74,13 +78,13 @@ mod smc_prime {
             return Err(PyRuntimeError::new_err("num_samples must be at least 2"));
         }
         let demography = if let Ok(ne) = population_size.extract::<f64>() {
-            simulations::Demography::constant(ne)
+            demography::Demography::constant(ne)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         } else if let Ok(triples) = population_size.extract::<Vec<(f64, f64, f64)>>() {
-            simulations::Demography::from_growth_tuples(&triples)
+            demography::Demography::piecewise_exponential_epochs(&triples)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         } else if let Ok(pairs) = population_size.extract::<Vec<(f64, f64)>>() {
-            simulations::Demography::from_tuples(&pairs)
+            demography::Demography::piecewise_constant_epochs(&pairs)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         } else if population_size.getattr("populations").is_ok() {
             parse_msprime_demography(population_size)?
