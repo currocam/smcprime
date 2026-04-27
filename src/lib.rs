@@ -1,10 +1,10 @@
 use pyo3::prelude::*;
 
 /// Demography model.
-mod demography;
+pub mod demography;
 
 /// Implements SMC' simulations
-mod simulations;
+pub mod simulations;
 
 /// A Python module implemented in Rust.
 #[pymodule]
@@ -98,12 +98,16 @@ mod smc_prime {
         let sequence_length = sequence_length.unwrap_or(1.0);
         let recombination_rate = recombination_rate.unwrap_or(0.0);
 
+        // We will allocate the tables via Python allocator.
+        // NOTE: can this be detach?
         let mut shared = tskit2tskit::SharedTableCollection::new(py, sequence_length)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         py.detach(|| -> Result<(), PyErr> {
-            // SAFETY: safe if tskit-rust and tskit-python share the same
-            // tsk_table_collection_t layout (same tskit-c version).
+            // SAFETY: the following call is safe if tskit-rust and tskit-python
+            // have the same ABI for tsk_table_collection_t.
+            // Further, we must know that the layout of the low-level _tskit.TableCollection
+            // is as described in the README of this crate.
             Ok(unsafe {
                 shared.with_mut_tables(|tables| -> Result<(), tskit2tskit::Error> {
                     simulations::sim_ancestry(

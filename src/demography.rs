@@ -66,11 +66,10 @@ impl Demography {
     }
 
     pub fn epoch_index_at(&self, t: Time) -> usize {
-        match self.epochs.binary_search_by(|e| {
-            e.start_time
-                .partial_cmp(&t)
-                .unwrap_or(Ordering::Less)
-        }) {
+        match self
+            .epochs
+            .binary_search_by(|e| e.start_time.partial_cmp(&t).unwrap_or(Ordering::Less))
+        {
             Ok(i) => i,
             // If binary_search_by returns Err(i), i is the index where t could be inserted to maintain sorted order.
             // Therefore, the epoch that covers t is at index i - 1.
@@ -152,5 +151,87 @@ impl Demography {
         Ok(Self {
             epochs: parsed_epochs,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Forward computation of the cumulative hazard (verified with sympy):
+    ///
+    /// \lambda(t) = \lambda_{0} e^{\alpha (t - s)}
+    ///
+    /// \alpha \neq 0: \frac{k \lambda_{0} \left(- e^{\alpha t_{1}} + e^{\alpha t_{2}}\right) e^{- \alpha s}}{\alpha}
+    ///
+    /// \alpha = 0: k \left(- \lambda_{0} t_{1} + \lambda_{0} t_{2}\right)
+    ///
+    /// This is the "obvious" formula that invert() must be the inverse of.
+    fn forward_hazard(epoch: &Epoch, t1: f64, t2: f64, k: f64) -> f64 {
+        let a = epoch.alpha;
+        let s = epoch.start_time;
+        let lam = epoch.lambda_start;
+        if epoch.is_constant() {
+            k * lam * (t2 - t1)
+        } else {
+            k * (lam / a) * ((a * (t2 - s)).exp() - (a * (t1 - s)).exp())
+        }
+    }
+
+    /// Total hazard from t1 to ∞. Only finite when α < 0:
+    ///
+    /// - \frac{k \lambda_{0} e^{- \alpha \left(s - t_{1}\right)}}{\alpha}
+    fn total_hazard(epoch: &Epoch, t1: f64, k: f64) -> f64 {
+        if epoch.alpha >= 0.0 {
+            return f64::INFINITY;
+        }
+        k * epoch.lambda_start / (-epoch.alpha) * (epoch.alpha * (t1 - epoch.start_time)).exp()
+    }
+
+    proptest! {
+        #[test]
+        fn invert_is_inverse_of_cumulative_hazard(
+            ne in 1.0f64..1000.0,
+            alpha in -0.05f64..0.05,
+            t1_offset in 0.0f64..50.0,
+            e in 0.01f64..10.0,
+            k in 0.5f64..20.0,
+        ) {
+            let epoch = Epoch { start_time: 0.0, lambda_start: 1.0 / ne, alpha };
+            let t1 = t1_offset;
+            const EPSILON: f64 = 1e-12;
+
+            match epoch.invert(t1, e, k) {
+                Some(t_coal) => {
+                    prop_assert!(t_coal >= t1);
+                    let got = forward_hazard(&epoch, t1, t_coal, k);
+                    let rel_err = (got - e).abs() / e;
+                    prop_assert!(rel_err < EPSILON,
+                        "e={e}, forward={got}, rel_err={rel_err}, alpha={alpha}");
+                }
+                None => {
+                    let h_max = total_hazard(&epoch, t1, k);
+                    prop_assert!(e > h_max,
+                        "None but e={e} <= total_hazard={h_max}");
+                }
+            }
+        }
+
+        #[test]
+        fn invert_is_monotone(
+            ne in 1.0f64..1000.0,
+            alpha in -0.02f64..0.02,
+            e1 in 0.01f64..5.0,
+            e2 in 0.01f64..5.0,
+            k in 1.0f64..10.0,
+        ) {
+            let epoch = Epoch { start_time: 0.0, lambda_start: 1.0 / ne, alpha };
+            if let (Some(t1), Some(t2)) = (epoch.invert(0.0, e1, k), epoch.invert(0.0, e2, k)) {
+                if e1 < e2 {
+                    prop_assert!(t1 <= t2, "e1={e1}<e2={e2} but t1={t1}>t2={t2}");
+                }
+            }
+        }
     }
 }
