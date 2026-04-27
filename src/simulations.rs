@@ -413,6 +413,7 @@ pub fn sim_ancestry(
             continue;
         }
         let p = tree.parent[cut_node].expect("cut node must have a parent");
+        // If target is p, pruning removes p — its branch becomes the sibling's branch.
         let effective_target = if target_node == p {
             tree.sibling(p, cut_node)
         } else {
@@ -463,7 +464,7 @@ pub fn sim_ancestry(
         table.add_edge(left, right, node_ids[par], node_ids[chi])?;
     }
 
-    table.full_sort(TableSortOptions::default())?;
+    table.full_sort(TableSortOptions::default().no_check_integrity())?;
     table.build_index()?;
     Ok(())
 }
@@ -474,7 +475,82 @@ mod tests {
     use crate::demography::Epoch;
     use proptest::prelude::*;
 
-    fn arb_demography() -> impl Strategy<Value = Demography> {
+    fn verify_tree_invariants(
+        tree: &CoalTree,
+        num_samples: usize,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        // 1. Exactly one root
+        let roots: Vec<usize> = (0..tree.time.len())
+            .filter(|&i| tree.parent[i].is_none() && tree.children[i].is_some())
+            .collect();
+        prop_assert_eq!(roots.len(), 1);
+
+        // 2. Parent↔child consistency + recompute total branch length
+        let mut expected_bl = 0.0;
+        for i in 0..tree.time.len() {
+            if let Some([left, right]) = tree.children[i] {
+                prop_assert_eq!(tree.parent[left], Some(i));
+                prop_assert_eq!(tree.parent[right], Some(i));
+                prop_assert!(tree.time[i] > tree.time[left]);
+                prop_assert!(tree.time[i] > tree.time[right]);
+            }
+            if let Some(p) = tree.parent[i] {
+                let ch = tree.children[p].expect("parent is internal");
+                prop_assert!(ch[0] == i || ch[1] == i);
+                expected_bl += tree.time[p] - tree.time[i];
+            }
+        }
+
+        // 3. Total branch length
+        const EPSILON: f64 = 1e-12;
+        prop_assert!((tree.total_branch_length - expected_bl).abs() < EPSILON);
+
+        // 4. Rebuild branch_map from scratch
+        let mut expected_map: BTreeMap<NotNan<f64>, Vec<NodeID>> = BTreeMap::new();
+        for i in 0..tree.time.len() {
+            match tree.parent[i] {
+                Some(p_id) => {
+                    expected_map
+                        .entry(NotNan::new(tree.time[p_id]).expect("finite"))
+                        .or_default()
+                        .push(i);
+                }
+                None if tree.children[i].is_some() => {
+                    expected_map
+                        .entry(NotNan::new(f64::INFINITY).expect("ok"))
+                        .or_default()
+                        .push(i);
+                }
+                _ => {}
+            }
+        }
+        prop_assert_eq!(tree.branch_map.len(), expected_map.len());
+        for (key, expected_nodes) in &expected_map {
+            let mut actual = tree.branch_map.get(key).expect("key present").clone();
+            let mut expected = expected_nodes.clone();
+            actual.sort();
+            expected.sort();
+            prop_assert_eq!(actual, expected);
+        }
+
+        // 5. All samples reachable from root
+        let mut stack = vec![roots[0]];
+        let mut leaf_count = 0usize;
+        while let Some(node) = stack.pop() {
+            match tree.children[node] {
+                Some([left, right]) => {
+                    stack.push(left);
+                    stack.push(right);
+                }
+                None => leaf_count += 1,
+            }
+        }
+        prop_assert_eq!(leaf_count, num_samples);
+
+        Ok(())
+    }
+
+    fn random_demography() -> impl Strategy<Value = Demography> {
         (1usize..=10usize)
             .prop_flat_map(|n| {
                 let gaps = proptest::collection::vec(1.0f64..=500.0f64, n - 1);
@@ -509,41 +585,89 @@ mod tests {
         fn coal_tree_is_valid(
             seed in 0u64..u64::MAX,
             num_samples in 2usize..=50,
-            demography in arb_demography(),
+            demography in random_demography(),
         ) {
             let mut rng = rand::rngs::Xoshiro256PlusPlus::seed_from_u64(seed);
             let tree = CoalTree::draw(&mut rng, num_samples, &demography);
-
-            prop_assert_eq!(tree.time.len(), 2 * num_samples - 1);
-
-            let n_roots = tree.parent.iter().filter(|p| p.is_none()).count();
-            prop_assert_eq!(n_roots, 1);
-
-            for i in num_samples..tree.time.len() {
-                let ch = tree.children[i];
-                prop_assert!(ch.is_some(),
-                    "internal node {} must have children", i);
-                prop_assert_eq!(ch.unwrap().len(), 2,
-                    "internal node {} must be binary", i);
-            }
-
-            for i in 0..tree.time.len() {
-                if let Some(p) = tree.parent[i] {
-                    prop_assert!(tree.time[p] > tree.time[i],
-                        "node {i}: parent time {} <= child time {}", tree.time[p], tree.time[i]);
-                }
-            }
+            verify_tree_invariants(&tree, num_samples)?;
         }
+
         #[test]
-        fn short_tree_is_valid(
+        fn short_sim_ancestry_does_not_panic(
             seed in 0u64..u64::MAX,
             num_samples in 2usize..=50,
-            demography in arb_demography(),
+            demography in random_demography(),
         ) {
             let mut table = TableCollection::new(1.0).unwrap();
             sim_ancestry(
                 &mut table, &demography, num_samples, 1.0, 1.0, seed
             ).unwrap();
+        }
+
+        #[test]
+        fn spr_preserves_invariants(
+            seed in 0u64..u64::MAX,
+            num_samples in 3usize..=30,
+            demography in random_demography(),
+        ) {
+            let mut rng = rand::rngs::Xoshiro256PlusPlus::seed_from_u64(seed);
+            let mut tree = CoalTree::draw(&mut rng, num_samples, &demography);
+
+            // Verify the initial tree
+            verify_tree_invariants(&tree, num_samples)?;
+
+            // Pick a random branch to cut (uniform_point)
+            let (cut_node, t_recomb) = tree.uniform_point(&mut rng);
+
+            // Draw recoalescence
+            let (t_coal, target) = tree.draw_recoalescence(&mut rng, &demography, t_recomb);
+
+            // Skip healing events (same node)
+            if target == cut_node {
+                return Ok(());
+            }
+            let p = tree.parent[cut_node].expect("cut_node has parent");
+            // If target is p, pruning removes p — its branch becomes the sibling's branch.
+            let effective_target = if target == p {
+                tree.sibling(p, cut_node)
+            } else {
+                target
+            };
+
+            tree.spr(cut_node, effective_target, t_coal);
+
+            // Verify all invariants after SPR
+            verify_tree_invariants(&tree, num_samples)?;
+        }
+
+        #[test]
+        fn spr_chain_preserves_invariants(
+            seed in 0u64..u64::MAX,
+            num_samples in 3usize..=20,
+            n_sprs in 1usize..=20,
+            demography in random_demography(),
+        ) {
+            let mut rng = rand::rngs::Xoshiro256PlusPlus::seed_from_u64(seed);
+            let mut tree = CoalTree::draw(&mut rng, num_samples, &demography);
+
+            for _ in 0..n_sprs {
+                let (cut_node, t_recomb) = tree.uniform_point(&mut rng);
+                let (t_coal, target) = tree.draw_recoalescence(&mut rng, &demography, t_recomb);
+
+                if target == cut_node {
+                    continue;
+                }
+                let p = tree.parent[cut_node].expect("has parent");
+                // If target is p, pruning removes p — its branch becomes the sibling's branch.
+            let effective_target = if target == p {
+                    tree.sibling(p, cut_node)
+                } else {
+                    target
+                };
+                tree.spr(cut_node, effective_target, t_coal);
+            }
+
+            verify_tree_invariants(&tree, num_samples)?;
         }
     }
 }

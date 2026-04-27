@@ -6,9 +6,10 @@ import pytest
 import scipy.stats as stats
 import smc_prime
 import tskit
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
-from hypothesis import given, settings, strategies as st
 
 
 def _parallel_map(values, fn):
@@ -247,6 +248,96 @@ def test_hypothesis_piecewise_exponential_robustness(epochs):
     assert np.isclose(
         ts_const.diversity(mode="branch"),
         ts_piecewise.diversity(mode="branch"),
+    )
+
+
+def test_coalescence_time_distribution_constant():
+    """
+    For n=2 haploid samples with constant Ne, the single coalescence time
+    is Exp(1/Ne) distributed (rate = 1 pair * 1/Ne).
+    Draw many replicates and KS-test against the expected distribution.
+    """
+    Ne = 500.0
+    n_reps = 2000
+    seeds = np.arange(1, n_reps + 1)
+
+    coal_times = _parallel_map(
+        seeds,
+        lambda s: smc_prime.sim_ancestry(
+            population_size=Ne,
+            num_samples=2,
+            recombination_rate=0.0,
+            random_seed=s,
+        ),
+    )
+    # Each tree sequence has a single tree; the root time is the coalescence time
+    times = np.array([ts.node(ts.first().root).time for ts in coal_times])
+    assert times.min() > 0, "All coalescence times must be positive"
+
+    # KS test against Exp(rate=1/Ne), i.e. scale=Ne
+    _, p_val = stats.kstest(times, "expon", args=(0, Ne))
+    assert p_val > 0.01, (
+        f"Coalescence times don't match Exp(1/Ne={Ne}): KS p={p_val:.4e}, "
+        f"mean={times.mean():.1f} (expected {Ne:.1f})"
+    )
+
+
+def test_coalescence_time_distribution_exponential_growth():
+    """
+    For n=2 with exponential growth, verify the coalescence time CDF
+    against msprime (ground truth). Both use SMC' model.
+    """
+    Ne = 200.0
+    alpha = 0.01
+    t_change = 100.0
+    N_change = Ne * np.exp(-alpha * t_change)
+    n_reps = 1000
+    seeds = np.arange(1, n_reps + 1)
+
+    smc_times = np.array(
+        [
+            ts.node(ts.first().root).time
+            for ts in _parallel_map(
+                seeds,
+                lambda s: smc_prime.sim_ancestry(
+                    population_size=[(0.0, Ne, alpha), (t_change, N_change, 0.0)],
+                    num_samples=2,
+                    recombination_rate=0.0,
+                    random_seed=s,
+                ),
+            )
+        ]
+    )
+
+    demo = msprime.Demography()
+    demo.add_population(name="pop_0", initial_size=Ne, growth_rate=alpha)
+    demo.add_population_parameters_change(
+        time=t_change, initial_size=N_change, growth_rate=0.0
+    )
+    ms_times = np.array(
+        [
+            ts.node(ts.first().root).time
+            for ts in _parallel_map(
+                seeds,
+                lambda s: msprime.sim_ancestry(
+                    samples=2,
+                    demography=demo,
+                    ploidy=1,
+                    model="smc_prime",
+                    recombination_rate=0.0,
+                    sequence_length=1.0,
+                    random_seed=s,
+                    discrete_genome=False,
+                ),
+            )
+        ]
+    )
+
+    # Two-sample KS test: both should come from the same distribution
+    _, p_val = stats.ks_2samp(smc_times, ms_times)
+    assert p_val > 0.01, (
+        f"Coal time distributions differ: KS p={p_val:.4e}, "
+        f"smc_prime mean={smc_times.mean():.1f}, msprime mean={ms_times.mean():.1f}"
     )
 
 
